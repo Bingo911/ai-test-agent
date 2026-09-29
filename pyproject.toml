@@ -3,17 +3,33 @@ name = "ai-test-agent"
 version = "0.1.0"
 description = "Markdown-driven, AI-assisted browser test automation platform."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
     "fastapi>=0.115,<1.0",
-    "pydantic>=2.10,<3.0",
-    "PyYAML>=6.0,<7.0",
+    "starlette>=0.41,<2.0",
     "uvicorn[standard]>=0.34,<1.0",
+    "pydantic>=2.10,<3.0",
+    "pydantic-settings>=2.7,<3.0",
+    "PyYAML>=6.0,<7.0",
+    "SQLAlchemy>=2.0.36,<2.1",
+    # The deployment target is PostgreSQL (§7); SQLite is only the development and test dialect.
+    "psycopg[binary]>=3.2,<4.0",
+    "playwright>=1.49,<2.0",
+    "celery[redis]>=5.4,<6.0",
+    "kombu>=5.4,<6.0",
+    "httpx>=0.28,<1.0",
+    "boto3>=1.35,<2.0",
+    "cryptography>=44.0,<51.0",
+    "PyJWT[crypto]>=2.10,<3.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3,<9.0", "httpx>=0.28,<1.0", "ruff>=0.11,<1.0"]
+dev = [
+    "pytest>=8.3,<10.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "ruff>=0.11,<1.0",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -22,6 +38,46 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["backend/app"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning:app.*"]
+
 [tool.ruff]
-line-length = 100
-target-version = "py311"
+line-length = 120
+target-version = "py310"
+src = ["backend", "tests", "scripts"]
+
+[tool.ruff.lint]
+# The default rule set of the pinned ruff is broad enough to include stub-only and stylistic rules;
+# this project pins what it actually wants checked so `ruff check` stays a review tool, not noise.
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RET", "PTH", "RUF", "S", "TRY", "PIE", "T20", "PT", "Q"]
+ignore = [
+    # A worker boundary must catch `Exception` so one step cannot kill the browser session: it records
+    # evidence and degrades instead of crashing (§9.5).
+    "BLE001",
+    # Every ApiError carries its own operator-facing sentence by design (§13.1).
+    "TRY003",
+    # `raise ... else return` reads better than an extracted helper in the compiler's guard clauses.
+    "TRY301",
+    # Worker handlers end their `try` with the verdict they computed; moving it to `else` would put it
+    # below the three except arms that share the same finalization path.
+    "TRY300",
+    # Handler and protocol signatures keep positional contracts; an unused parameter is not dead code.
+    "ARG001",
+    "ARG002",
+    # Chinese DSL text and operator messages contain full-width punctuation on purpose.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106"]
+"scripts/*" = ["T201", "T203", "S105", "S106"]
+# Permission and error-code identifiers contain the word "secret"; they never carry a credential.
+"backend/app/domain/*" = ["S105"]
+# The runtime loop CLI prints its own report for `--once`; it is a human-facing entrypoint.
+"backend/app/orchestrator/runtime.py" = ["T201"]
+

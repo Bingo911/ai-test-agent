@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试站点 · 登录</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 40px; }
+    .field { margin-bottom: 12px; }
+    label { display: block; font-size: 13px; color: #555; }
+    input[type=text], input[type=password] { padding: 6px 8px; width: 220px; }
+    #welcome, #error { margin-top: 16px; font-weight: 600; }
+    #error { color: #b3261e; }
+    #welcome { color: #127112; }
+    .hidden-panel { display: none; }
+    button { padding: 6px 14px; }
+  </style>
+</head>
+<body>
+  <h1>本地测试站点</h1>
+  <p id="lead">该页面由测试执行器驱动，用于验证定位、断言与证据采集。</p>
+
+  <form id="login" onsubmit="return false;">
+    <div class="field">
+      <label for="username">用户名</label>
+      <input id="username" name="username" type="text" placeholder="请输入用户名" />
+    </div>
+    <div class="field">
+      <label for="password">密码</label>
+      <input id="password" name="password" type="password" placeholder="请输入密码" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="avatar">头像</label>
+      <input id="avatar" name="avatar" type="file" />
+    </div>
+    <button id="login-button" type="button" aria-label="登录">登录</button>
+  </form>
+
+  <div id="welcome" class="hidden-panel">欢迎回来，demo</div>
+  <div id="error" class="hidden-panel">用户名或密码错误</div>
+
+  <section id="ambiguous">
+    <h2>歧义区域</h2>
+    <button type="button" class="dupe">重复</button>
+    <button type="button" class="dupe">重复</button>
+  </section>
+
+  <section id="lazy">
+    <h2>延迟内容</h2>
+    <button id="lazy-button" type="button">加载详情</button>
+    <div id="lazy-result" class="hidden-panel">详情已加载</div>
+  </section>
+
+  <section id="network">
+    <h2>状态接口</h2>
+    <button id="status-button" type="button">查询状态</button>
+    <span id="status">未查询</span>
+  </section>
+
+  <p><a href="/about.html" id="about-link">关于本站</a></p>
+
+  <div class="hidden-panel" id="secret-panel">隐藏内容不应在可见断言中出现</div>
+
+  <script>
+    console.log("test-site loaded");
+    const show = (id) => document.getElementById(id).classList.remove("hidden-panel");
+    const hide = (id) => document.getElementById(id).classList.add("hidden-panel");
+
+    document.getElementById("login-button").addEventListener("click", () => {
+      const user = document.getElementById("username").value;
+      const pass = document.getElementById("password").value;
+      hide("welcome");
+      hide("error");
+      if (user === "demo" && pass.length > 0) {
+        show("welcome");
+        console.log("login ok");
+      } else {
+        show("error");
+        console.warn("login rejected");
+      }
+    });
+
+    document.getElementById("lazy-button").addEventListener("click", () => {
+      setTimeout(() => show("lazy-result"), 400);
+    });
+
+    document.querySelectorAll(".dupe").forEach((node) =>
+      node.addEventListener("click", () => {
+        console.log("dupe clicked");
+      })
+    );
+
+    document.getElementById("status-button").addEventListener("click", async () => {
+      const target = document.getElementById("status");
+      target.textContent = "查询中";
+      try {
+        const response = await fetch("/api/status");
+        const payload = await response.json();
+        target.textContent = payload.state;
+      } catch (error) {
+        target.textContent = "查询失败";
+        console.error("status fetch failed", String(error));
+      }
+    });
+  </script>
+</body>
+</html>

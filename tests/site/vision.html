@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试站点 · 视觉兜底</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    /* Fixed position and a known box: the visual stub can point at its centre without measuring. */
+    #vision-target { position: fixed; left: 20px; top: 20px; width: 180px; height: 60px; }
+    #result { margin: 120px 20px 0; }
+  </style>
+</head>
+<body>
+  <button id="vision-target" type="button" aria-label="固定目标">按下</button>
+  <p id="result">未点击</p>
+  <script>
+    document.getElementById('vision-target').addEventListener('click', () => {
+      document.getElementById('result').textContent = '视觉点击已记录';
+    });
+  </script>
+</body>
+</html>

@@ -7,6 +7,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+# Local database, uploaded evidence objects and the browser bundle pulled in by `playwright install`.
+data/
+.pw-browsers/
 node_modules/
 dist/
 coverage/

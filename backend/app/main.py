@@ -1,62 +1,149 @@
+"""Composition root for the API process (§13.2).
+
+In production this serves HTTP only and Celery workers run the control loops. In development the
+same process also owns those loops, so `uvicorn app.main:app` is a complete, runnable platform.
+"""
+
 from __future__ import annotations
 
-from typing import Annotated
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
 
-from .parser import ParseError, compile_markdown
+from .api import cases, environments, evidence, executions, humans, projects, quality, system
+from .api.deps import RequestContextMiddleware, register_exception_handlers
+from .config import Settings, get_settings
+from .db.bootstrap import bootstrap_runtime
+from .observability import configure_logging, get_logger
+from .orchestrator.queue import InProcessQueue
 
-app = FastAPI(
-    title="AI Test Agent API",
-    version="0.1.0",
-    description="Parse Markdown test cases into a validated, deterministic Test IR.",
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-Request-ID"],
-)
+log = get_logger(__name__)
+
+API_PREFIX = "/api/v1"
+
+#: Keeps the two same-named legacy routes from reappearing: the parser prototype was replaced by the
+#: compile pipeline, and a stale path in the docs invites clients to build against a dead contract.
+OPENAPI_TAGS = [
+    {"name": "system", "description": "Health, capability discovery and the caller's own authority."},
+    {"name": "projects", "description": "Projects, membership and permission grants (§14.1)."},
+    {"name": "cases", "description": "Case drafts, revisions, compilation and confirmation (§9.2)."},
+    {"name": "environments", "description": "Environment records, revisions and secrets (§10.1)."},
+    {"name": "executions", "description": "Run creation, state, events, reports and analysis (§9.1)."},
+    {"name": "human", "description": "Human-assist tasks, control tickets and live frames (§10.3)."},
+    {"name": "evidence", "description": "Download tickets and authorized artifact proxying (§12.1)."},
+    {"name": "quality", "description": "Aggregate metrics and the audit trail (§16.1)."},
+]
+
+#: A reload must not leave a second set of loops publishing to the same queue.
+SHUTDOWN_DRAIN_SECONDS = 10.0
 
 
-class ParseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    markdown: Annotated[str, Field(min_length=1, max_length=262144)]
+def _owns_loops(settings: Settings) -> bool:
+    """Only the single-process development server runs the loops in-process (§15.1)."""
+    return settings.app_env == "development"
 
 
-@app.get("/api/v1/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "ai-test-agent-api", "version": app.version}
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = app.state.settings
+    settings.ensure_dirs()
+    settings.validate_runtime()
+    workspace = bootstrap_runtime(settings, seed=settings.is_development)
+    supervisor = None
+    if _owns_loops(settings):
+        from .orchestrator.runtime import Supervisor
 
-
-@app.get("/api/v1/capabilities")
-def capabilities() -> dict[str, object]:
-    return {
-        "actions": ["open", "click", "input", "clear", "upload", "wait", "assert", "screenshot"],
-        "browsers": ["chromium", "chrome"],
-        "features": {
-            "markdown_parser": "available",
-            "test_ir": "1.0",
-            "browser_execution": "planned",
-            "ai_compilation": "planned",
-            "human_handoff": "planned",
+        supervisor = Supervisor(settings).start()
+    log.info(
+        "api started",
+        extra={
+            "context": {
+                "env": settings.app_env,
+                "auth_mode": settings.auth_mode,
+                "queue_backend": settings.queue_backend,
+                "loops_in_process": supervisor is not None,
+                "project_id": (workspace or {}).get("project_id"),
+            }
         },
-    }
-
-
-@app.post("/api/v1/cases/parse")
-def parse_case(request: ParseRequest) -> dict[str, object]:
+    )
     try:
-        ir, review_required = compile_markdown(request.markdown)
-    except ParseError as exc:
-        raise HTTPException(status_code=422, detail=exc.as_dict()) from exc
-    return {
-        "status": "NEEDS_REVIEW" if review_required else "SUCCEEDED",
-        "ir": ir,
-        "diagnostics": [],
-    }
+        yield
+    finally:
+        if supervisor is not None:
+            supervisor.stop()
+            queue = supervisor.queue
+            # Tasks already published are given a moment to finish; anything left is handed to the
+            # reconciler, which treats an abandoned lease as a worker loss rather than a lost run.
+            if isinstance(queue, InProcessQueue):
+                queue.drain(timeout=SHUTDOWN_DRAIN_SECONDS)
+                queue.close()
+        log.info("api stopped", extra={"context": {"env": settings.app_env}})
+
+
+def create_app(settings: Settings | None = None, *, openapi_extra: dict[str, Any] | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.log_level, json_output=not settings.is_development)
+
+    application = FastAPI(
+        title="AI Test Agent",
+        version="1.0.0",
+        summary="Markdown test cases to deterministic, evidence-backed browser runs.",
+        description=(
+            "Cases are compiled into a validated Test IR, executed on the caller's own browser under a "
+            "resourced state machine, and reported with evidence. Requests are tenant-scoped; writes may "
+            "carry an Idempotency-Key to replay their own first response, and versioned resources accept "
+            "If-Match."
+        ),
+        docs_url=f"{API_PREFIX}/docs",
+        redoc_url=None,
+        openapi_url=f"{API_PREFIX}/openapi.json",
+        lifespan=lifespan,
+        openapi_tags=OPENAPI_TAGS,
+    )
+    application.state.settings = settings
+
+    # Outermost first: an error response still needs CORS headers, or the console only sees a network fault.
+    application.add_middleware(RequestContextMiddleware, max_body_bytes=settings.max_request_body_bytes)
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.web_origin],
+        # Tokens travel in the Authorization header, so no cookie or client certificate is ever sent.
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "If-Match",
+            "Idempotency-Key",
+            "X-Request-ID",
+            "X-Tenant-Id",
+        ],
+        expose_headers=["ETag", "X-Request-ID"],
+        max_age=600,
+    )
+    register_exception_handlers(application)
+
+    for module in (system, projects, cases, environments, executions, humans, evidence, quality):
+        application.include_router(module.router, prefix=API_PREFIX)
+    if openapi_extra:
+        application.openapi_schema = {**(application.openapi_schema or {}), **openapi_extra}
+    return application
+
+
+app = create_app()
+
+
+def main() -> None:
+    """Serve the API on the configured bind, so `API_HOST`/`API_PORT` mean what the operator set (§15.1)."""
+    import uvicorn
+
+    settings = get_settings()
+    # `log_config=None` keeps uvicorn from reinstalling the root logger that configure_logging owns.
+    uvicorn.run(app, host=settings.api_host, port=settings.api_port, log_config=None)
+
+
+if __name__ == "__main__":
+    main()

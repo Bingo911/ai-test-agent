@@ -1,26 +1,116 @@
 name: ai-test-agent
+
+# The §15.1 development topology: PostgreSQL, Redis, the serving process, the browser workers and the
+# console. It is deliberately `APP_ENV=development`, so the API owns the control loops and one
+# instance is enough; a split deployment sets APP_ENV=production (auth_mode=oidc required) and runs
+# `python -m app.orchestrator.runtime` as the single process that owns those loops.
+#
+# Evidence sits on a shared volume because OBJECT_STORE=local writes under DATA_DIR. Point
+# OBJECT_STORE=s3 at MinIO or S3 and the workers no longer need to see the same filesystem.
+
+x-app-env: &app-env
+  APP_ENV: development
+  DATABASE_URL: postgresql+psycopg://aita:aita@db:5432/aita
+  REDIS_URL: redis://redis:6379/0
+  QUEUE_BACKEND: celery
+  OBJECT_STORE: local
+  DATA_DIR: /app/data
+  WEB_ORIGIN: http://localhost:5173
+  BROWSER_HEADLESS: "true"
+  # Containers run as root, where Chromium's own setuid sandbox helper is refused; the loopback
+  # fixture and the allowlisted public sites are the only targets here (§14.4 egress rules apply).
+  BROWSER_SANDBOX: "false"
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: *app-env
+  volumes:
+    - app-data:/app/data
+
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aita
+      POSTGRES_PASSWORD: aita
+      POSTGRES_DB: aita
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aita -d aita"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  # Structure comes up once, from a one-shot job, rather than from every API replica at startup (§15.1).
+  schema:
+    <<: *app
+    command: ["python", "-c", "from app.db.base import get_database; get_database().create_schema()"]
+    depends_on:
+      db:
+        condition: service_healthy
+
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     ports:
       - "8000:8000"
-    environment:
-      WEB_ORIGIN: http://localhost:5173
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      schema:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health')"]
       interval: 15s
       timeout: 3s
       retries: 5
+
+  worker-execution:
+    <<: *app
+    # WORKER_SLOTS is the Celery concurrency: each prefork child announces exactly one browser slot.
+    environment:
+      <<: *app-env
+      WORKER_SLOTS: "2"
+    command: ["celery", "-A", "app.celery_app:app", "worker", "-Q", "execution", "-l", "info"]
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker-background:
+    <<: *app
+    environment:
+      <<: *app-env
+      WORKER_SLOTS: "2"
+    command: ["celery", "-A", "app.celery_app:app", "worker", "-Q", "compile,analysis", "-l", "info"]
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
   web:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    environment:
-      API_PROXY_TARGET: http://api:8000
     ports:
       - "5173:5173"
     depends_on:
       api:
         condition: service_healthy
+
+volumes:
+  app-data:
+  db-data:
+  redis-data:
