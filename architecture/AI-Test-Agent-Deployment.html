@@ -1,0 +1,142 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>AI-Test-Agent-Deployment</title><style>html,body{margin:0;padding:0;background:#f6f8fc}svg{display:block}</style><svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1380" viewBox="0 0 1800 1380" role="img">
+<title>部署架构与信任边界</title><desc>生产基线：可信控制面与不可信浏览器隔离；每个执行单独授权、限额和回收</desc>
+<defs><marker id="arr-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,5 L0,10 Z" fill="#2563eb"/></marker><marker id="arr-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,5 L0,10 Z" fill="#087f72"/></marker><marker id="arr-purple" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,5 L0,10 Z" fill="#7c3aed"/></marker><marker id="arr-orange" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,5 L0,10 Z" fill="#c66a15"/></marker><marker id="arr-gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,5 L0,10 Z" fill="#607086"/></marker></defs>
+<rect width="1800" height="1380" fill="#f6f8fc"/>
+<text x="54" y="57" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="34" font-weight="700" fill="#14213a" text-anchor="start">部署架构与信任边界</text>
+<text x="56" y="94" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="17" font-weight="400" fill="#596a82" text-anchor="start">生产基线：可信控制面与不可信浏览器隔离；每个执行单独授权、限额和回收</text>
+<text x="1746" y="56" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="16" font-weight="400" fill="#53647d" text-anchor="end">AI TEST AGENT  /  V1.1</text>
+<rect x="50" y="135" width="410" height="1020" rx="20" fill="#ffffff" stroke="#2563eb" stroke-opacity=".22" stroke-width="1.5"/>
+<text x="74" y="169" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="700" fill="#2563eb" text-anchor="start">A  用户与访问入口</text>
+<text x="74" y="195" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="14" font-weight="400" fill="#65748a" text-anchor="start">浏览器端不持有平台秘密</text>
+<rect x="500" y="135" width="720" height="1020" rx="20" fill="#ffffff" stroke="#087f72" stroke-opacity=".22" stroke-width="1.5"/>
+<text x="524" y="169" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="700" fill="#087f72" text-anchor="start">B  可信控制面</text>
+<text x="524" y="195" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="14" font-weight="400" fill="#65748a" text-anchor="start">私网服务 · 服务身份 · 最小权限</text>
+<rect x="1260" y="135" width="490" height="1020" rx="20" fill="#ffffff" stroke="#c66a15" stroke-opacity=".22" stroke-width="1.5"/>
+<text x="1284" y="169" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="700" fill="#c66a15" text-anchor="start">C  不可信执行区</text>
+<text x="1284" y="195" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="14" font-weight="400" fill="#65748a" text-anchor="start">每执行独立容器与网络策略</text>
+<path d="M 255,305 L 255,365" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-blue)"/>
+<path d="M 415,415 L 465,415 L 465,270 L 535,270" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-blue)"/>
+<path d="M 415,425 L 485,425 L 485,440 L 535,440" fill="none" stroke="#c66a15" stroke-width="2" stroke-linejoin="round" stroke-dasharray="7 5" marker-end="url(#arr-orange)"/>
+<path d="M 865,270 L 900,270" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-blue)"/>
+<path d="M 690,325 L 690,385" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-green)"/>
+<path d="M 690,495 L 690,555" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-green)"/>
+<path d="M 865,445 L 900,445" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-green)"/>
+<path d="M 690,680 L 690,740" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-green)"/>
+<path d="M 1040,495 L 1040,525 L 780,525 L 780,555" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-green)"/>
+<path d="M 865,600 L 900,600" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-green)"/>
+<path d="M 1185,610 L 1230,610 L 1230,390 L 1295,390" fill="none" stroke="#c66a15" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-orange)"/>
+<rect x="1224" y="520" width="90" height="21" rx="4" fill="#f6f8fc"/>
+<text x="1229" y="535" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="13" font-weight="400" fill="#c66a15" text-anchor="start">创建 / 销毁</text>
+<path d="M 790,680 L 790,710 L 1245,710 L 1245,480 L 1295,480" fill="none" stroke="#087f72" stroke-width="2" stroke-linejoin="round" stroke-dasharray="7 5" marker-end="url(#arr-green)"/>
+<rect x="906" y="691" width="158" height="21" rx="4" fill="#f6f8fc"/>
+<text x="911" y="706" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="13" font-weight="400" fill="#087f72" text-anchor="start">私网 mTLS / 会话路由</text>
+<path d="M 1505,565 L 1505,705" fill="none" stroke="#c66a15" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-orange)"/>
+<rect x="1518" y="631" width="94" height="21" rx="4" fill="#f6f8fc"/>
+<text x="1523" y="646" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="13" font-weight="400" fill="#c66a15" text-anchor="start">唯一业务出口</text>
+<path d="M 1505,815 L 1505,875" fill="none" stroke="#c66a15" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-orange)"/>
+<path d="M 255,670 L 255,735" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-purple)"/>
+<path d="M 535,640 L 480,640 L 480,619 L 415,619" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round" stroke-dasharray="7 5" marker-end="url(#arr-purple)"/>
+<rect x="85" y="215" width="330" height="90" rx="12" fill="#fdfefe" stroke="#2563eb" stroke-width="1.6"/>
+<rect x="86" y="229" width="4" height="62" rx="2" fill="#2563eb"/>
+<text x="105" y="246" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">Web Console</text>
+<text x="105" y="273" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">测试工程师 / 负责人 / 管理员</text>
+<rect x="85" y="365" width="330" height="115" rx="12" fill="#fdfefe" stroke="#2563eb" stroke-width="1.6"/>
+<rect x="86" y="379" width="4" height="87" rx="2" fill="#2563eb"/>
+<text x="105" y="396" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">Load Balancer / 入口代理</text>
+<text x="105" y="423" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">HTTPS / WSS · 请求体限制</text>
+<text x="105" y="446" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">REST / SSE / 人工 WebSocket</text>
+<rect x="85" y="565" width="330" height="105" rx="12" fill="#fdfefe" stroke="#7c3aed" stroke-width="1.6"/>
+<rect x="86" y="579" width="4" height="77" rx="2" fill="#7c3aed"/>
+<text x="105" y="596" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">AI 策略与出口</text>
+<text x="105" y="623" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">项目许可 · 脱敏 · 费用预算</text>
+<text x="105" y="646" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">仅允许审核后的模型请求</text>
+<rect x="85" y="735" width="330" height="110" rx="12" fill="#fdfefe" stroke="#7c3aed" stroke-width="1.6"/>
+<rect x="86" y="749" width="4" height="82" rx="2" fill="#7c3aed"/>
+<text x="105" y="766" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">模型提供商</text>
+<text x="105" y="793" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">外部或私有化部署，可禁用</text>
+<text x="105" y="816" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">不是平台权限或状态来源</text>
+<rect x="85" y="925" width="330" height="170" rx="12" fill="#fdfefe" stroke="#2563eb" stroke-width="1.6"/>
+<rect x="86" y="939" width="4" height="142" rx="2" fill="#2563eb"/>
+<text x="105" y="956" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">客户端安全约束</text>
+<text x="105" y="983" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">OIDC issuer + subject 身份键</text>
+<text x="105" y="1006" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">人工控制票据一次性兑换</text>
+<text x="105" y="1029" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">OTP / 密码不写控制日志</text>
+<text x="105" y="1052" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">证据链接按项目权限签发</text>
+<rect x="535" y="215" width="330" height="110" rx="12" fill="#fdfefe" stroke="#087f72" stroke-width="1.6"/>
+<rect x="536" y="229" width="4" height="82" rx="2" fill="#087f72"/>
+<text x="555" y="246" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">FastAPI × 2+</text>
+<text x="555" y="273" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">业务 API / 鉴权 / SSE</text>
+<text x="555" y="296" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">静态页面与敏感证据分源</text>
+<rect x="900" y="215" width="285" height="110" rx="12" fill="#fdfefe" stroke="#087f72" stroke-width="1.6"/>
+<rect x="901" y="229" width="4" height="82" rx="2" fill="#087f72"/>
+<text x="920" y="246" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">身份 / KMS</text>
+<text x="920" y="273" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">OIDC / 版本化密钥</text>
+<text x="920" y="296" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">长期凭证仅控制面可用</text>
+<rect x="535" y="385" width="330" height="110" rx="12" fill="#fdfefe" stroke="#087f72" stroke-width="1.6"/>
+<rect x="536" y="399" width="4" height="82" rx="2" fill="#087f72"/>
+<text x="555" y="416" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">调度与控制服务</text>
+<text x="555" y="443" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">Scheduler / Outbox / Reconciler</text>
+<text x="555" y="466" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">Human Gateway / 会话路由</text>
+<rect x="900" y="385" width="285" height="110" rx="12" fill="#fdfefe" stroke="#087f72" stroke-width="1.6"/>
+<rect x="901" y="399" width="4" height="82" rx="2" fill="#087f72"/>
+<text x="920" y="416" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">Redis / Celery</text>
+<text x="920" y="443" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">独立工作队列</text>
+<text x="920" y="466" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">ID + 预留代次</text>
+<rect x="535" y="555" width="330" height="125" rx="12" fill="#fdfefe" stroke="#087f72" stroke-width="1.6"/>
+<rect x="536" y="569" width="4" height="97" rx="2" fill="#087f72"/>
+<text x="555" y="586" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">Worker 控制进程池</text>
+<text x="555" y="613" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">Compiler / Browser / Analyzer</text>
+<text x="555" y="636" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">Browser 槽位持有活会话</text>
+<text x="555" y="659" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">可信结果采集与状态写入</text>
+<rect x="900" y="555" width="285" height="125" rx="12" fill="#fdfefe" stroke="#087f72" stroke-width="1.6"/>
+<rect x="901" y="569" width="4" height="97" rx="2" fill="#087f72"/>
+<text x="920" y="586" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">Supervisor</text>
+<text x="920" y="613" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">受限容器生命周期权限</text>
+<text x="920" y="636" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">资源 ID + epoch 定位</text>
+<text x="920" y="659" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">确认销毁后释放预留</text>
+<rect x="535" y="740" width="650" height="155" rx="12" fill="#fdfefe" stroke="#2563eb" stroke-width="1.6"/>
+<rect x="536" y="754" width="4" height="127" rx="2" fill="#2563eb"/>
+<text x="555" y="771" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">私有数据服务</text>
+<text x="555" y="798" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">PostgreSQL：RLS / 版本 / 预留 / 事件 / Outbox</text>
+<text x="555" y="821" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">对象存储：证据 / 校验 / 加密 / 保留策略</text>
+<text x="555" y="844" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">控制面按服务身份访问；浏览器网络无法直接连接</text>
+<text x="555" y="867" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">备份与恢复演练；Redis 消息丢失从数据库重建</text>
+<rect x="535" y="955" width="650" height="140" rx="12" fill="#fdfefe" stroke="#607086" stroke-width="1.6"/>
+<rect x="536" y="969" width="4" height="112" rx="2" fill="#607086"/>
+<text x="555" y="986" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">运维与容量</text>
+<text x="555" y="1013" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">指标 / 脱敏日志 / 告警 · 不暴露高基数标签</text>
+<text x="555" y="1036" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">发布先 draining；等待占槽计入容量</text>
+<text x="555" y="1059" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">异常收尾独立于原 Worker；隔离资源不被误释放</text>
+<rect x="1295" y="215" width="420" height="100" rx="12" fill="#fdfefe" stroke="#c66a15" stroke-width="1.6"/>
+<rect x="1296" y="229" width="4" height="72" rx="2" fill="#c66a15"/>
+<text x="1315" y="246" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">浏览器执行节点池</text>
+<text x="1315" y="273" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">每执行独立容器；不能共享宿主网络</text>
+<text x="1315" y="296" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">非 root / sandbox / CPU / 内存 / PID</text>
+<rect x="1295" y="355" width="420" height="210" rx="12" fill="#fdfefe" stroke="#c66a15" stroke-width="1.6"/>
+<rect x="1296" y="369" width="4" height="182" rx="2" fill="#c66a15"/>
+<text x="1315" y="386" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">执行容器 N</text>
+<text x="1315" y="413" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">Playwright Server + Chrome / Chromium</text>
+<text x="1315" y="436" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">浏览器沙箱 / Context / Page / 临时盘</text>
+<text x="1315" y="459" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">WAIT_HUMAN 保留原进程和页面</text>
+<text x="1315" y="482" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">无平台 DB / Redis / KMS 凭证</text>
+<text x="1315" y="505" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">控制协议只允许已授权控制端连接</text>
+<text x="1315" y="528" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">容器临时证据仅由控制端受控取回</text>
+<rect x="1295" y="705" width="420" height="110" rx="12" fill="#fdfefe" stroke="#c66a15" stroke-width="1.6"/>
+<rect x="1296" y="719" width="4" height="82" rx="2" fill="#c66a15"/>
+<text x="1315" y="736" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">项目 / 执行出口代理</text>
+<text x="1315" y="763" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">域名与依赖白名单 · 阻断元数据地址</text>
+<text x="1315" y="786" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">DNS / 重定向 / 子资源 / WS 均受约束</text>
+<rect x="1295" y="875" width="420" height="100" rx="12" fill="#fdfefe" stroke="#607086" stroke-width="1.6"/>
+<rect x="1296" y="889" width="4" height="72" rx="2" fill="#607086"/>
+<text x="1315" y="906" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">授权目标环境</text>
+<text x="1315" y="933" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">公网测试站点或获批的项目内网</text>
+<text x="1315" y="956" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">目标站点不能访问平台控制面</text>
+<rect x="1295" y="1015" width="420" height="80" rx="12" fill="#fdfefe" stroke="#c66a15" stroke-width="1.6"/>
+<rect x="1296" y="1029" width="4" height="52" rx="2" fill="#c66a15"/>
+<text x="1315" y="1046" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="20" font-weight="650" fill="#172a46" text-anchor="start">不允许直接访问 B 区存储</text>
+<text x="1315" y="1073" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#53647a" text-anchor="start">网络策略 + 无凭证，两层隔离</text>
+<rect x="50" y="1190" width="1700" height="64" rx="12" fill="#eaf0fa"/>
+<text x="70" y="1216" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="16" font-weight="700" fill="#274a79" text-anchor="start">故障与信任约定</text>
+<text x="70" y="1239" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="15" font-weight="400" fill="#435b7c" text-anchor="start">实线：主要访问 / 生命周期操作；虚线：人工或浏览器控制、受限 AI 请求。控制面与执行区隔离必须由生产环境验收。</text>
+<text x="56" y="1300" font-family="'Microsoft YaHei','Noto Sans CJK SC','Segoe UI',sans-serif" font-size="17" font-weight="400" fill="#445b7c" text-anchor="start">生产方案是设计目标：单机开发可以模拟拓扑，但不能以同容器进程隔离代替多租户生产安全边界。</text>
+</svg></html>

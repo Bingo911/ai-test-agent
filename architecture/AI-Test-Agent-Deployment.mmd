@@ -1,0 +1,41 @@
+flowchart LR
+    USER[用户浏览器] -->|HTTPS / WSS| LB[入口代理]
+    subgraph PRIVATE[可信控制面 / 私有网络]
+        API[FastAPI 多副本 / OIDC / RBAC / SSE]
+        HG[人工操作网关 / 短时票据]
+        OPS[Scheduler + Outbox + Reconciler]
+        Q[(Redis / Celery)]
+        WORK[Compiler / Browser / Analyzer Workers]
+        SUP[受限 Supervisor]
+        PG[(PostgreSQL / RLS / Outbox / Reservation)]
+        STORE[(对象存储 / 加密 / 授权)]
+        KMS[KMS / 版本化密钥]
+        IDP[OIDC 身份提供方 / issuer + subject]
+        AI[模型出口 / 脱敏 / 限额]
+        API --> IDP
+        API --> PG
+        OPS --> PG
+        OPS --> Q
+        Q --> WORK
+        WORK --> PG
+        WORK --> STORE
+        WORK --> KMS
+        WORK --> AI
+        WORK --> SUP
+        OPS -->|清理故障会话| SUP
+        HG -. 仅当前持有者 .-> WORK
+    end
+    subgraph UNTRUSTED[每执行独立浏览器容器 / 不可信运行区]
+        PW[Playwright Server + 浏览器沙箱]
+        TEMP[受限临时证据目录]
+        PW --> TEMP
+    end
+    LB --> API
+    LB --> HG
+    SUP -->|创建 / 限额 / 销毁| PW
+    WORK -. 私网 mTLS 控制 / 受控取回证据 .-> PW
+    PW --> PROXY[项目与执行级出口代理]
+    PROXY --> SITE[授权目标网站与依赖域名]
+    AI --> MODEL[外部或私有模型 / 可禁用]
+    NOTE[浏览器容器无平台长期凭证<br/>不可连接 PG / Redis / KMS / 对象存储<br/>不暴露宿主容器运行时接口]
+    NOTE -.- PW

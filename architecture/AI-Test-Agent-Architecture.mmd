@@ -1,0 +1,67 @@
+flowchart TB
+    subgraph UI[用户入口]
+        WEB[React Web Console]
+        GATE[入口代理 / TLS / REST / SSE / WSS]
+        WEB --> GATE
+    end
+    subgraph CP[可信控制面]
+        API[FastAPI / OIDC / RBAC]
+        MGMT[用例修订 / 环境 / IR 审核 / 报告]
+        HUMAN[Human Task Service / 操作网关]
+        SCHED[Scheduler / 公平调度 / 配额预留]
+        OUT[Outbox Dispatcher]
+        REC[Reconciler / 超时与故障收尾]
+        SUP[Supervisor / 容器生命周期]
+        DB[(PostgreSQL / 状态权威来源)]
+        Q[(Redis / Celery 三类队列)]
+        COMP[Compiler Worker / Parser + AI + IR 校验]
+        RUN[Browser Worker / Executor + Locator + Collector]
+        ANAL[Failure Analyzer Worker]
+        POLICY[AI Adapter / 脱敏 / 限额 / Schema]
+        OBJ[(对象存储 / 受限证据)]
+        KEY[KMS / 版本化秘密]
+        API --> MGMT
+        API --> HUMAN
+        MGMT --> DB
+        HUMAN --> DB
+        DB -. 唤醒 + 定期扫描 .-> SCHED
+        SCHED -->|同事务写 reservation 与执行 Outbox| DB
+        OUT -->|读取未投递 Outbox| DB
+        OUT -->|ID + reservation_id + generation| Q
+        Q --> COMP
+        Q --> RUN
+        Q --> ANAL
+        COMP -->|IR / 诊断 / 审核状态| DB
+        RUN -->|租约 / 步骤 / 事件| DB
+        ANAL -->|诊断建议 / 不改 outcome| DB
+        RUN --> OBJ
+        OBJ -->|仅授权脱敏证据| ANAL
+        COMP --> POLICY
+        RUN -->|视觉候选请求| POLICY
+        ANAL --> POLICY
+        RUN -->|执行级秘密权限| KEY
+        HUMAN -. 单控制者 / 短时票据 .-> RUN
+        REC --> DB
+        REC -->|幂等销毁 / 禁止续跑| SUP
+        RUN --> SUP
+    end
+    subgraph ISO[不可信浏览器区 / 每执行隔离]
+        BROWSER[Playwright Server + Chrome / Chromium]
+        EGRESS[执行级出口代理 / 网络策略]
+        BROWSER --> EGRESS
+    end
+    GATE --> API
+    GATE --> HUMAN
+    SUP -->|创建与回收| BROWSER
+    RUN -. 私网受限 mTLS 控制 .-> BROWSER
+    EGRESS --> TARGET[授权测试网站]
+    POLICY --> MODEL[可关闭的模型提供商]
+
+    classDef control fill:#eef5ff,stroke:#2563eb,color:#172a46
+    classDef runtime fill:#eefaf6,stroke:#087f72,color:#172a46
+    classDef ai fill:#f5efff,stroke:#7c3aed,color:#172a46
+    classDef boundary fill:#fff6eb,stroke:#c66a15,color:#172a46
+    class API,MGMT,DB,OBJ,KEY control
+    class SCHED,OUT,Q,RUN runtime
+    class COMP,ANAL,POLICY,MODEL ai
+    class HUMAN,REC,SUP,BROWSER,EGRESS boundary
