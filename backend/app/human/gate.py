@@ -25,9 +25,10 @@ from ..domain.enums import (
     HumanTaskStatus,
     Outcome,
     ResumePhase,
+    Sensitivity,
 )
 from ..domain.errors import ErrorCode
-from ..executors.contracts import HumanRequired, StepInterrupted
+from ..executors.contracts import HumanRequired, RunTermination, StepInterrupted
 from ..executors.locator import LocatorBudget
 from ..executors.playwright.actions import evaluate_condition
 from ..executors.playwright.session import BrowserSession
@@ -66,7 +67,7 @@ COMMAND_POLL_SECONDS = 1.0
 RESUME_CHECK_BUDGET_MS = 10_000
 
 
-class HumanGateError(Exception):
+class HumanGateError(RunTermination):
     """A pause that cannot be honoured, carrying the outcome the worker must finalise with."""
 
     def __init__(
@@ -232,17 +233,10 @@ class HumanGate:
         )
         try:
             resolution = await self._wait_for_resume(state, decision)
-        except HumanGateError:
-            self._accumulate_wait(state, self._waited_ms(state))
-            self.state = None
-            raise
         finally:
             plane.close(task.id)
+            self._accumulate_wait(state, self._waited_ms(state))
             self.state = None
-        waited_ms = self._waited_ms(state)
-        self._accumulate_wait(state, waited_ms)
-        # time spent waiting for a person is never charged to the step (§10.3)
-        self.context.interruption.detail["human_waited_ms"] = int(waited_ms)
         if resolution == "cancelled":
             self.context.interruption.cancel = True
             return
@@ -260,6 +254,13 @@ class HumanGate:
         last_check = 0.0
         while True:
             now = time.monotonic()
+            if self.context.hard_deadline_ms is not None and now * 1000 >= self.context.hard_deadline_ms:
+                self._close_task(state, status=HumanTaskStatus.EXPIRED.value, note="the task hard limit elapsed")
+                raise HumanGateError(
+                    ErrorCode.ACTIVE_TIMEOUT.value,
+                    "the task hard limit elapsed while awaiting a human",
+                    outcome=Outcome.TIMED_OUT.value,
+                )
             deadline = self._task_deadline(state.human_task_id)
             if deadline is not None and coerce_utc(deadline) <= utcnow():
                 self._expire_task(state)
@@ -337,7 +338,8 @@ class HumanGate:
         if decision.resume_condition is None or step_completed:
             # `mode=before` needs no condition: the operator's confirmation *is* the resume signal (§10.3).
             return True, None, step_completed
-        return await self._evaluate_condition(decision.resume_condition)
+        satisfied, why = await self._evaluate_condition(decision.resume_condition)
+        return satisfied, why, False
 
     # ---------------------------------------------------------------- operator input
 
@@ -474,6 +476,8 @@ class HumanGate:
         action_context = self.executor.action_context(self.session, self.context)
         budget = LocatorBudget.for_step(step_timeout_ms=RESUME_CHECK_BUDGET_MS, vision_enabled=False)
         deadline = monotonic_ms() + RESUME_CHECK_BUDGET_MS
+        if self.context.hard_deadline_ms is not None:
+            deadline = min(deadline, self.context.hard_deadline_ms)
         try:
             satisfied, why, _ = await evaluate_condition(
                 parsed, action_context, deadline_monotonic_ms=deadline, budget=budget
@@ -694,6 +698,7 @@ class HumanGate:
     def _accumulate_wait(self, state: HumanSessionState, waited_ms: int) -> None:
         if waited_ms <= 0:
             return
+        self.context.human_waited_ms += waited_ms
         with self.db.session(self.tenant_id) as session:
             repo = ExecutionRepository(session, self.tenant_id)
             execution = repo.load(self.execution_id)
@@ -721,6 +726,17 @@ class HumanGate:
     async def _suspend_sensitive_capture(self) -> None:
         """§10.4: stop raw tracing and revoke video before any control ticket is issued."""
         session = self.session
+        self.context.evidence_mode = Sensitivity.SENSITIVE.value
+        self.context.vision = None
+        if self.context.evidence is not None:
+            self.context.evidence.evidence_mode = Sensitivity.SENSITIVE.value
+        session.video_publish_allowed = False
+        with self.db.session(self.tenant_id) as scope:
+            ExecutionRepository(scope, self.tenant_id).countersigned_update(
+                self.execution_id,
+                epoch=int(self.context.lease_epoch),
+                values={"evidence_mode": Sensitivity.SENSITIVE.value},
+            )
         if session.trace_started:
             try:
                 await session.context.tracing.stop()

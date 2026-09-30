@@ -155,13 +155,21 @@ class DatabaseEvidenceSink:
     def _record_ring(self, kind: str, entries: Sequence[dict[str, Any]], *, step_id: str | None) -> str | None:
         if not entries:
             return None
-        payload = json.dumps(
-            [_scrub(entry, self.known_secrets) for entry in entries], ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
         limit = self.settings.dom_evidence_max_bytes
-        if len(payload) > limit:
+        encoded = [
+            json.dumps(_scrub(entry, self.known_secrets), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            for entry in entries
+        ]
+        selected: list[bytes] = []
+        size = 2
+        for entry in reversed(encoded):
+            upcoming = len(entry) + bool(selected)
+            if size + upcoming <= limit:
+                selected.append(entry)
+                size += upcoming
+        if len(selected) != len(encoded):
             self.mark_truncated(f"{kind} index exceeded {limit} bytes")
-            payload = payload[:limit]
+        payload = b"[" + b",".join(reversed(selected)) + b"]"
         return self.put_bytes(
             kind=kind,
             name=f"{kind}.json",

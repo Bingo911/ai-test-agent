@@ -93,6 +93,9 @@ class Database:
             kwargs.update(pool_size=pool_size, max_overflow=pool_size, pool_pre_ping=True, pool_recycle=1800)
         self.url = url
         self.engine: Engine = create_engine(url, **kwargs)
+        from ..services.storage_crypto import cipher_for_dialect
+
+        cipher_for_dialect(self.engine.dialect)
         if self.engine.dialect.name == "sqlite":
 
             @event.listens_for(self.engine, "connect")

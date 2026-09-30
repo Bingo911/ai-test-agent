@@ -10,6 +10,7 @@ from ..db.base import new_id, utcnow
 from ..db.models import SecretVersion
 from ..domain.enums import Sensitivity
 from ..domain.errors import ApiError, ErrorCode
+from .storage_crypto import StorageCipher
 
 
 class SecretStore:
@@ -23,17 +24,7 @@ class SecretStore:
 
     def fernet(self) -> Fernet:
         if self._fernet is None:
-            material = self.settings.secret_master_key
-            if not material:
-                path = self.settings.data_dir / "keys" / "master.key"
-                if path.exists():
-                    material = path.read_text(encoding="utf-8").strip()
-                else:
-                    material = Fernet.generate_key().decode("ascii")
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(material, encoding="utf-8")
-                    path.chmod(0o600)
-            self._fernet = Fernet(material.encode("utf-8"))
+            self._fernet = StorageCipher(self.settings).fernet
         return self._fernet
 
     def put(
@@ -154,8 +145,15 @@ class SecretStore:
         """IR referencing secrets, or an explicit request, forces SENSITIVE evidence (§10.4)."""
         if requested == Sensitivity.SENSITIVE.value:
             return Sensitivity.SENSITIVE.value
-        text = str(ir_payload or {})
-        if '"secret"' in text or "${secrets." in text:
+
+        def contains_secret(node) -> bool:
+            if isinstance(node, dict):
+                return node.get("kind") == "secret" or any(contains_secret(value) for value in node.values())
+            if isinstance(node, list):
+                return any(contains_secret(value) for value in node)
+            return isinstance(node, str) and "${secrets." in node
+
+        if contains_secret(ir_payload):
             return Sensitivity.SENSITIVE.value
         return requested or Sensitivity.NORMAL.value
 

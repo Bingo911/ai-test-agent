@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     ai_timeout_seconds: float = 30.0
     ai_max_calls_per_run: int = 2
     ai_max_total_ms: int = 60_000
+    ai_compiler_max_calls: int = Field(default=400, ge=1)
+    ai_compiler_max_total_ms: int = Field(default=600_000, ge=1)
+    ai_analysis_images_enabled: bool = False
     ai_max_output_tokens: int = 2048
     ai_prompt_version: str = "compiler-1.0/analysis-1.0"
     ai_vision_enabled: bool = False
@@ -188,6 +191,10 @@ class Settings(BaseSettings):
             problems.append("redis_url is required when queue_backend=celery")
         if self.ai_enabled and not self.ai_base_url:
             problems.append("ai_base_url is required when ai_enabled")
+        if self.secret_provider != "local_fernet":  # noqa: S105 (provider name, not a credential)
+            problems.append(
+                "only local_fernet is implemented; inject its master key through the deployment secret manager"
+            )
         if not self.is_development:
             problems.extend(self._production_problems())
         if problems:
@@ -203,8 +210,8 @@ class Settings(BaseSettings):
         if self.auth_mode == "oidc" and not (self.oidc_issuer and self.oidc_jwks_uri):
             problems.append("oidc_issuer and oidc_jwks_uri are required when auth_mode=oidc")
         # "local_fernet" names a provider, it is not a credential.
-        if self.secret_provider == "local_fernet" and not self.secret_master_key:  # noqa: S105
-            problems.append("secret_master_key is required for the local_fernet secret provider")
+        if not self.secret_master_key:
+            problems.append("secret_master_key is required for secrets and stored test-data encryption")
         if self.database_url.startswith("sqlite"):
             problems.append("a sqlite database is not supported outside development")
         return problems

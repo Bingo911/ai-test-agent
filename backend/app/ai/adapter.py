@@ -73,8 +73,8 @@ class AiAdapter:
         self.purpose = purpose
         self.base_url = (settings.ai_base_url or "").rstrip("/")
         self.timeout = timeout_seconds or settings.ai_timeout_seconds
-        self.max_calls = settings.ai_max_calls_per_run
-        self.max_total_ms = settings.ai_max_total_ms
+        self.max_calls = settings.ai_compiler_max_calls if purpose == "compiler" else settings.ai_max_calls_per_run
+        self.max_total_ms = settings.ai_compiler_max_total_ms if purpose == "compiler" else settings.ai_max_total_ms
         self.usage = AiUsage(model=settings.ai_model)
         self._json_supported = True
 
@@ -89,7 +89,7 @@ class AiAdapter:
         return headers
 
     def chat_json(
-        self, messages: list[dict[str, str]], *, temperature: float = 0.0, max_tokens: int | None = None
+        self, messages: list[dict[str, Any]], *, temperature: float = 0.0, max_tokens: int | None = None
     ) -> AiCall:
         if not self.enabled:
             raise AiUnavailable("AI provider is disabled or not configured")

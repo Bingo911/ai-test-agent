@@ -7,6 +7,7 @@ execution. A model outage leaves the deterministic answer in place and the run r
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -17,6 +18,7 @@ from ..analysis.classifier import (
     failing_step,
     neighbour_summary,
 )
+from ..analysis.evidence import trace_summary
 from ..config import Settings, get_settings
 from ..db.base import get_database
 from ..domain.enums import AnalysisStatus, ArtifactKind, Sensitivity
@@ -31,6 +33,9 @@ log = get_logger(__name__)
 #: What may be sent to the provider: bounded, already-redacted text summaries only (§12.3, §14.4).
 DOM_SNIPPET_BYTES = 4_000
 RING_SUMMARY_ITEMS = 12
+RING_MAX_BYTES = 2 * 1024 * 1024
+IMAGE_MAX_BYTES = 2 * 1024 * 1024
+TRACE_MAX_BYTES = 20 * 1024 * 1024
 MAX_MODEL_OUTPUT_CHARS = 4_000
 
 SYSTEM_PROMPT = (
@@ -62,7 +67,11 @@ class AnalysisWorker:
         row_id, _project_id = self._start(tenant_id, facts)
         self._write(tenant_id, row_id, status=AnalysisStatus.SUCCEEDED.value, source="rules", error_code=None, **rules)
 
-        if not self.settings.ai_enabled or not facts["failing_step"]:
+        if (
+            not self.settings.ai_enabled
+            or not facts["failing_step"]
+            or facts["evidence_mode"] == Sensitivity.SENSITIVE.value
+        ):
             self._set_status(
                 tenant_id,
                 execution_id,
@@ -189,10 +198,14 @@ class AnalysisWorker:
 
     def _explain(self, adapter: AiAdapter, facts: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
         brief = self._brief(facts, rules)
+        content: str | list[dict[str, Any]] = json.dumps(brief, ensure_ascii=False)[:60_000]
+        images = self._images(facts) if self.settings.ai_analysis_images_enabled else []
+        if images:
+            content = [{"type": "text", "text": content}, *images]
         call = adapter.chat_json(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(brief, ensure_ascii=False)[:60_000]},
+                {"role": "user", "content": content},
             ],
             temperature=0.0,
         )
@@ -225,7 +238,7 @@ class AnalysisWorker:
         }
 
     def _evidence(self, facts: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
-        """Reads only indexed, publishable text evidence of this execution (§12.3)."""
+        """Use public normal text and a local action-only projection of private traces (§12.3)."""
         out: dict[str, Any] = {"available": [], "omitted": []}
         if facts["evidence_mode"] == Sensitivity.SENSITIVE.value:
             out["omitted"].append("sensitive execution: no evidence content is sent to the model")
@@ -233,12 +246,31 @@ class AnalysisWorker:
         with self.db.session(facts["tenant_id"]) as session:
             rows = ArtifactRepository(session, facts["tenant_id"]).for_execution(facts["execution_id"])
         store = get_object_store(self.settings)
-        publishable = [row for row in rows if row.publish_allowed]
+        ready = [row for row in reversed(rows) if row.upload_status == "READY"]
+        ready.sort(key=lambda row: row.step_id != step.get("step_id"))
+        publishable = [row for row in ready if row.publish_allowed and row.sensitivity == Sensitivity.NORMAL.value]
         out["available"] = [
             {"ref": f"artifact:{row.id}", "kind": row.kind, "name": row.name, "size": int(row.size or 0)}
             for row in publishable
         ]
-        for row in publishable:
+        for row in ready:
+            if row.kind == ArtifactKind.TRACE.value and "trace_actions" not in out:
+                # Traces contain raw session data and remain private. Only the strict local
+                # projection may cross the model boundary, regardless of download permission.
+                try:
+                    summary = trace_summary(store.read_bytes(row.object_key, max_bytes=TRACE_MAX_BYTES))
+                except Exception:
+                    summary = []
+                if summary:
+                    out["trace_actions"] = {"ref": f"artifact:{row.id}", "actions": summary}
+                    facts.setdefault("projected_artifact_refs", []).append(f"artifact:{row.id}")
+                    if row not in publishable:
+                        out["available"].append(
+                            {"ref": f"artifact:{row.id}", "kind": row.kind, "projection": "actions_only"}
+                        )
+                continue
+            if not row.publish_allowed or row.sensitivity != Sensitivity.NORMAL.value:
+                continue
             if row.kind == ArtifactKind.DOM.value and "dom_snippets" not in out:
                 text = self._read_text(store, row.object_key, DOM_SNIPPET_BYTES)
                 if text:
@@ -246,32 +278,60 @@ class AnalysisWorker:
                     out["dom_snippets"] = [f"artifact:{row.id}: {text}"]
             elif row.kind in (ArtifactKind.CONSOLE.value, ArtifactKind.NETWORK.value):
                 entries = self._read_ring(store, row.object_key)
-                if entries:
+                if entries and row.kind.lower() not in out.get("summaries", {}):
                     out.setdefault("summaries", {})
                     out["summaries"][row.kind.lower()] = entries[:RING_SUMMARY_ITEMS]
         if step.get("artifact_ids"):
             out["failing_step_artifacts"] = [f"artifact:{item}" for item in step["artifact_ids"]]
-        out["omitted"].append("raw trace, video and cookies are never sent")
+        out["omitted"].append("raw trace, video, cookies and trace parameter values are never sent")
         return out
+
+    def _images(self, facts: dict[str, Any]) -> list[dict[str, Any]]:
+        """Explicit opt-in; only a publishable, normal screenshot of the failing step."""
+        step = facts.get("failing_step") or {}
+        if facts["evidence_mode"] == Sensitivity.SENSITIVE.value or not step:
+            return []
+        with self.db.session(facts["tenant_id"]) as session:
+            rows = ArtifactRepository(session, facts["tenant_id"]).for_execution(facts["execution_id"])
+        store = get_object_store(self.settings)
+        for row in rows:
+            if (
+                row.kind != ArtifactKind.SCREENSHOT.value
+                or row.step_id != step.get("step_id")
+                or not row.publish_allowed
+                or row.sensitivity != Sensitivity.NORMAL.value
+                or row.upload_status != "READY"
+                or row.media_type != "image/png"
+            ):
+                continue
+            try:
+                data = store.read_bytes(row.object_key, max_bytes=IMAGE_MAX_BYTES)
+            except Exception:
+                log.info("analysis screenshot unavailable", extra={"context": {"artifact_id": row.id}})
+                continue
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                continue
+            return [
+                {"type": "text", "text": f"Failure screenshot reference: artifact:{row.id}"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(data).decode()}"}},
+            ]
+        return []
 
     def _read_text(self, store: Any, key: str, limit: int) -> str | None:
         try:
-            return store.read_bytes(key, max_bytes=limit).decode("utf-8", errors="replace")[:limit]
+            return store.read_prefix(key, max_bytes=limit).decode("utf-8", errors="replace")[:limit]
         except Exception:
             return None
 
     def _read_ring(self, store: Any, key: str) -> list[dict[str, Any]]:
-        text = self._read_text(store, key, 64_000)
-        if not text:
-            return []
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
+            payload = json.loads(store.read_bytes(key, max_bytes=RING_MAX_BYTES))
+        except Exception:
             return []
         items = (
             payload if isinstance(payload, list) else payload.get("entries", []) if isinstance(payload, dict) else []
         )
-        return [item for item in items if isinstance(item, dict)][:RING_SUMMARY_ITEMS]
+        return [item for item in items if isinstance(item, dict)][-RING_SUMMARY_ITEMS:]
 
     # ------------------------------------------------------------------ validation
 
@@ -310,7 +370,7 @@ class AnalysisWorker:
     @staticmethod
     def _ref_exists(ref: str, facts: dict[str, Any]) -> bool:
         if ref.startswith("artifact:"):
-            return ref in facts["artifact_refs"]
+            return ref in facts["artifact_refs"] or ref in facts.get("projected_artifact_refs", [])
         parts = ref.split(":")
         # `step:<id>` and `step:<id>:locator-attempt:<n>` both point at a step of this run.
         return len(parts) >= 2 and any(step.get("step_id") == parts[1] for step in facts["steps"])

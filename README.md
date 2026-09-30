@@ -106,7 +106,23 @@ AITA_API_URL=http://127.0.0.1:8000 python scripts/live_check.py
 
 ## 配置
 
-`.env.example` 按 §15.2 的分组列出键名与含义；启动时做交叉校验（`visibility_timeout > task_hard_limit`、`lease_ttl > heartbeat × 3` 等），不通过就拒绝启动。秘密提供 `local_fernet` 与 `kms` 两种，模型凭据只从环境变量注入。
+`.env.example` 按 §15.2 的分组列出键名与含义；启动时做交叉校验（`visibility_timeout > task_hard_limit`、`lease_ttl > heartbeat × 3` 等），不通过就拒绝启动。当前秘密和测试数据使用 `local_fernet`；生产环境通过部署密钥管理器注入 `SECRET_MASTER_KEY`，API 与所有 Worker 必须使用同一密钥。`kms` 适配器尚未实现，配置该值会拒绝启动。模型凭据从运行环境注入。
+
+自然语言编译使用独立的 `AI_COMPILER_MAX_CALLS`（默认 400 次）与 `AI_COMPILER_MAX_TOTAL_MS`（默认 10 分钟）预算；视觉与分析仍受 `AI_MAX_CALLS_PER_RUN` 限制。人工等待从步骤及活动执行预算中扣除，总任务硬截止时间始终有效。
+
+失败分析读取有界 DOM 片段、完整日志环的末尾摘要，以及本地提取的 Trace 动作名称、耗时和失败标记；Trace 参数、页面快照及原始错误文本不会发送。`AI_ANALYSIS_IMAGES_ENABLED=true` 可显式开启失败步骤的已脱敏普通截图分析。敏感运行使用本地规则分析；原始 Trace、视频、敏感文本及不可发布截图不会发送给模型。
+
+## 存储加密与升级
+
+数据库的 Text/JSON 测试内容（包括 Markdown、IR、环境配置、执行快照、事件与分析）及本地/S3 对象写入时使用带认证的加密，标识、状态和索引字段保持可查询。读写接口透明解密，报告下载保留原始文件长度和摘要。开发环境自动生成 `data/keys/master.key`；生产密钥需要与数据库/对象备份分开保管，丢失密钥将无法恢复密文。生产数据库卷、备份和浏览器临时目录仍需由部署环境提供加密与访问控制。
+
+旧明文数据兼容读取。升级已有实例时，先暂停 API/Worker 并保存原数据及密钥的受保护备份，再使用相同运行配置执行：
+
+```bash
+python -m scripts.encrypt_storage
+```
+
+该命令分批加密数据库旧内容和对象，可重复执行；S3 模式仅迁移配置桶的 `tenants/` 前缀，保留对象键和内容类型。新写入数据默认加密。迁移后应替换或安全清理旧明文备份，并重启所有进程使用更新后的模型类型。
 
 ## 边界
 

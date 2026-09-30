@@ -71,6 +71,7 @@ async def run_action(
     budget: LocatorBudget,
 ) -> dict[str, Any]:
     """Dispatch to the registered handler; returns detail for the step record (§7.3 order)."""
+    ac.check_interrupted(deadline_monotonic_ms)
     handler = HANDLERS.get(action)
     if handler is None:  # the compiler only emits these eight, so this is a build mismatch
         raise StepExecutionError("unsupported_scope", f"action '{action}' is not implemented by this executor")
@@ -89,7 +90,7 @@ async def _open(
     if not url.lower().startswith(("http://", "https://")):
         raise StepExecutionError("navigation_failed", f"only http(s) navigations are supported, got '{url[:40]}'")
     try:
-        response = await ac.page.goto(url, wait_until=step.wait_until, timeout=max(500, timeout))
+        response = await ac.page.goto(url, wait_until=step.wait_until, timeout=max(1, timeout))
     except StepInterrupted:
         raise
     except Exception as exc:
@@ -146,6 +147,7 @@ async def _click(
         step, ac, step.target, action="click", deadline_monotonic_ms=deadline_monotonic_ms, budget=budget
     )
     version_before = await page_version(ac.page)
+    ac.check_interrupted(deadline_monotonic_ms)
     _dispatch(ac, step, "INTENT_RECORDED")
     try:
         await resolution.locator.first.click(timeout=int(ac.remaining_ms(deadline_monotonic_ms)))
@@ -166,6 +168,7 @@ async def _input(
     resolution = await _resolve_target(
         step, ac, step.target, action="input", deadline_monotonic_ms=deadline_monotonic_ms, budget=budget
     )
+    ac.check_interrupted(deadline_monotonic_ms)
     _dispatch(ac, step, "INTENT_RECORDED")
     try:
         await resolution.locator.first.fill(value.value, timeout=int(ac.remaining_ms(deadline_monotonic_ms)))
@@ -189,6 +192,7 @@ async def _clear(
     resolution = await _resolve_target(
         step, ac, step.target, action="clear", deadline_monotonic_ms=deadline_monotonic_ms, budget=budget
     )
+    ac.check_interrupted(deadline_monotonic_ms)
     _dispatch(ac, step, "INTENT_RECORDED")
     try:
         await resolution.locator.first.fill("", timeout=int(ac.remaining_ms(deadline_monotonic_ms)))
@@ -227,6 +231,7 @@ async def _upload(
     resolution = await _resolve_target(
         step, ac, step.target, action="upload", deadline_monotonic_ms=deadline_monotonic_ms, budget=budget
     )
+    ac.check_interrupted(deadline_monotonic_ms)
     _dispatch(ac, step, "INTENT_RECORDED")
     try:
         await resolution.locator.first.set_input_files(paths, timeout=int(ac.remaining_ms(deadline_monotonic_ms)))

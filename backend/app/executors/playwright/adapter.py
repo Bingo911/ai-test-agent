@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from ..contracts import (
     FailureKind,
     HumanRequired,
     RunContext,
+    RunTermination,
     SessionConfig,
     StepExecutionError,
     StepInterrupted,
@@ -123,14 +125,22 @@ class PlaywrightExecutor:
         deadline_ms: float,
         budget: LocatorBudget | None = None,
     ) -> StepResult:
+        waited_before = context.human_waited_ms
+        result = await self._execute_step(session, step, context, deadline_ms=deadline_ms, budget=budget)
+        result.duration_ms = max(0, result.duration_ms - (context.human_waited_ms - waited_before))
+        return result
+
+    async def _execute_step(
+        self,
+        session: BrowserSession,
+        step: Step,
+        context: RunContext,
+        *,
+        deadline_ms: float,
+        budget: LocatorBudget | None = None,
+    ) -> StepResult:
         started = _now_ms()
-        ac = self.action_context(session, context)
-        locator_budget = budget or LocatorBudget.for_step(
-            step_timeout_ms=int(max(1, deadline_ms - _now_ms())),
-            vision_enabled=bool(
-                ac.engine.vision_allowed and getattr(getattr(step, "target", None), "allow_vision", False)
-            ),
-        )
+        waited_before = context.human_waited_ms
         try:
             # §7.3 puts the human gate before any locator attempt: a paused run must not touch the target.
             # The gate is awaited because a wait for a person must not block the loop that serves the
@@ -139,7 +149,19 @@ class PlaywrightExecutor:
                 verdict = context.human_hook(step)
                 if inspect.isawaitable(verdict):
                     await verdict
+            deadline_ms += context.human_waited_ms - waited_before
+            if context.hard_deadline_ms is not None:
+                deadline_ms = min(deadline_ms, context.hard_deadline_ms)
+            ac = self.action_context(session, context)
+            locator_budget = budget or LocatorBudget.for_step(
+                step_timeout_ms=int(max(1, deadline_ms - _now_ms())),
+                vision_enabled=bool(
+                    ac.engine.vision_allowed and getattr(getattr(step, "target", None), "allow_vision", False)
+                ),
+            )
             detail = await run_action(step.action, step, ac, deadline_monotonic_ms=deadline_ms, budget=locator_budget)
+        except RunTermination:
+            raise
         except StepInterrupted as interruption:
             return self._result(
                 step,
@@ -252,6 +274,16 @@ class PlaywrightExecutor:
             await session.playwright.stop()
         except Exception as exc:  # pragma: no cover
             collector.note_capture_error(f"playwright stop: {exc}")
+        root = Path(self.settings.scratch_dir).resolve()
+        scratch = Path(session.scratch_dir).resolve()
+        expected = (root / context.execution_id).resolve()
+        if scratch == expected and scratch != root and scratch.is_relative_to(root):
+            try:
+                shutil.rmtree(scratch)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                collector.note_capture_error(f"scratch cleanup: {exc}")
         bundle.errors = list(collector.capture_errors)
         return bundle
 
@@ -266,6 +298,10 @@ class PlaywrightExecutor:
             source = Path(await video.path())
         except Exception as exc:
             collector.note_capture_error(f"video collection: {exc}")
+            return
+        if not session.video_publish_allowed:
+            if source.resolve().is_relative_to(Path(session.scratch_dir).resolve()):
+                source.unlink(missing_ok=True)
             return
         artifact_id = collector.put_file(
             kind="video",

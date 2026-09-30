@@ -6,6 +6,7 @@ Local filesystem for development, S3-compatible for production.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Protocol
 from ..config import Settings
 from ..domain.errors import ApiError, ErrorCode
 from ..observability import get_logger
+from .storage_crypto import StorageCipher
 
 log = get_logger(__name__)
 
@@ -52,6 +54,8 @@ class ObjectStore(Protocol):
 
     def read_bytes(self, key: str, *, max_bytes: int | None = None) -> bytes: ...
 
+    def read_prefix(self, key: str, *, max_bytes: int) -> bytes: ...
+
     def local_path(self, key: str) -> Path | None: ...
 
     def exists(self, key: str) -> bool: ...
@@ -61,12 +65,15 @@ class ObjectStore(Protocol):
 
 class LocalObjectStore:
     def __init__(self, root: Path) -> None:
-        self.root = root
+        resolved = str(root.resolve())
+        if os.name == "nt" and not resolved.startswith("\\\\?\\"):
+            resolved = "\\\\?\\UNC\\" + resolved[2:] if resolved.startswith("\\\\") else "\\\\?\\" + resolved
+        self.root = Path(resolved)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> Path:
         target = (self.root / normalize_object_key(key)).resolve()
-        if not str(target).startswith(str(self.root.resolve())):
+        if not target.is_relative_to(self.root.resolve()):
             raise ApiError(ErrorCode.VALIDATION_ERROR, "Object key escapes the storage root")
         return target
 
@@ -96,10 +103,17 @@ class LocalObjectStore:
         path = self._path(key)
         if not path.exists():
             raise ApiError(ErrorCode.NOT_FOUND, "Artifact object is missing")
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1) if max_bytes is not None else handle.read()
         if max_bytes is not None and len(data) > max_bytes:
             raise ApiError(ErrorCode.PAYLOAD_TOO_LARGE, "Artifact exceeds the download limit")
         return data
+
+    def read_prefix(self, key: str, *, max_bytes: int) -> bytes:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        with self._path(key).open("rb") as handle:
+            return handle.read(max_bytes)
 
     def local_path(self, key: str) -> Path | None:
         return self._path(key)
@@ -148,13 +162,29 @@ class S3ObjectStore:
 
     def read_bytes(self, key: str, *, max_bytes: int | None = None) -> bytes:
         try:
-            range_header = f"bytes=0-{max_bytes - 1}" if max_bytes else None
-            response = self.client.get_object(
-                Bucket=self.bucket, Key=normalize_object_key(key), **({"Range": range_header} if range_header else {})
-            )
-            return response["Body"].read()
+            response = self.client.get_object(Bucket=self.bucket, Key=normalize_object_key(key))
+            body = response["Body"]
+            try:
+                data = body.read(max_bytes + 1) if max_bytes is not None else body.read()
+            finally:
+                body.close()
+            if max_bytes is not None and len(data) > max_bytes:
+                raise ApiError(ErrorCode.PAYLOAD_TOO_LARGE, "Artifact exceeds the download limit")
+            return data
         except self.client.exceptions.NoSuchKey as exc:
             raise ApiError(ErrorCode.NOT_FOUND, "Artifact object is missing") from exc
+
+    def read_prefix(self, key: str, *, max_bytes: int) -> bytes:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        response = self.client.get_object(
+            Bucket=self.bucket, Key=normalize_object_key(key), Range=f"bytes=0-{max_bytes - 1}"
+        )
+        body = response["Body"]
+        try:
+            return body.read(max_bytes)
+        finally:
+            body.close()
 
     def local_path(self, key: str) -> Path | None:
         return None
@@ -173,14 +203,59 @@ class S3ObjectStore:
 _store: ObjectStore | None = None
 
 
+class EncryptedObjectStore:
+    """Encrypt both local and S3 bytes; authorized consumers get the original plaintext and digest."""
+
+    def __init__(self, store: ObjectStore, settings: Settings) -> None:
+        self.store = store
+        self.cipher = StorageCipher(settings)
+        self.max_bytes = settings.artifact_max_bytes
+
+    def put_bytes(self, key: str, data: bytes, media_type: str) -> StoredObject:
+        if len(data) > self.max_bytes:
+            raise ApiError(ErrorCode.PAYLOAD_TOO_LARGE, "Object exceeds the storage limit")
+        self.store.put_bytes(key, self.cipher.encrypt(data), media_type)
+        return StoredObject(key, len(data), "sha256:" + hashlib.sha256(data).hexdigest(), media_type)
+
+    def put_file(self, key: str, path: Path, media_type: str) -> StoredObject:
+        with path.open("rb") as handle:
+            data = handle.read(self.max_bytes + 1)
+        return self.put_bytes(key, data, media_type)
+
+    def read_bytes(self, key: str, *, max_bytes: int | None = None) -> bytes:
+        limit = self.max_bytes if max_bytes is None else min(max_bytes, self.max_bytes)
+        # Fernet's padded base64 envelope needs extra space, while plaintext limits remain authoritative.
+        raw = self.store.read_bytes(key, max_bytes=((limit + 256) * 4 // 3) + 128)
+        data = self.cipher.decrypt(raw)
+        if len(data) > limit:
+            raise ApiError(ErrorCode.PAYLOAD_TOO_LARGE, "Artifact exceeds the download limit")
+        return data
+
+    def read_prefix(self, key: str, *, max_bytes: int) -> bytes:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        # Authenticate the whole encrypted object before exposing any prefix.
+        return self.read_bytes(key)[:max_bytes]
+
+    def local_path(self, key: str) -> Path | None:
+        return None
+
+    def exists(self, key: str) -> bool:
+        return self.store.exists(key)
+
+    def delete(self, key: str) -> None:
+        self.store.delete(key)
+
+
 def get_object_store(settings: Settings | None = None) -> ObjectStore:
     global _store
     if _store is None:
         resolved = settings or Settings()
         resolved.ensure_dirs()
-        _store = (
+        raw_store = (
             S3ObjectStore(resolved) if resolved.object_store == "s3" else LocalObjectStore(resolved.local_store_dir)
         )
+        _store = EncryptedObjectStore(raw_store, resolved)
     return _store
 
 

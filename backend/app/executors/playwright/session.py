@@ -112,6 +112,7 @@ class BrowserSession:
     started_monotonic_ms: float
     scratch_dir: Any
     trace_started: bool = False
+    video_publish_allowed: bool = True
     events: list[dict[str, Any]] = field(default_factory=list)
     scope_violations: list[str] = field(default_factory=list)
 

@@ -8,6 +8,7 @@ the assertions read only what those workers left in the database and the object 
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from backend.app.domain.enums import (
     StepStatus,
 )
 from backend.app.domain.errors import ApiError, ErrorCode
+from backend.app.human.registry import get_control_plane
 from backend.app.orchestrator.queue import InProcessQueue
 from backend.app.orchestrator.runtime import Supervisor
 from backend.app.orchestrator.tasks import task_handlers
@@ -28,6 +30,7 @@ from backend.app.reporting.report import build_report
 from backend.app.repositories.artifacts import ArtifactRepository, FailureAnalysisRepository
 from backend.app.repositories.cases import CompileRepository
 from backend.app.repositories.executions import ExecutionRepository
+from backend.app.repositories.human import CommandRepository, HumanTaskRepository
 from backend.app.repositories.reservations import PoolRepository, ReservationRepository
 from backend.app.repositories.resources import EnvironmentRepository
 from backend.app.services.cases import CaseService
@@ -432,3 +435,105 @@ def test_cancel_before_the_worker_claims_it_finishes_immediately(site, settings,
     with database.session(tenant_id) as scope:
         assert PoolRepository(scope, "").by_name("default").reserved_count == 0
         assert ReservationRepository(scope, tenant_id).current_for_execution(execution.id) is None
+
+
+@pytest.mark.parametrize("mode", ["before", "on_challenge"])
+def test_human_control_keeps_the_browser_and_resumes_verified_steps(
+    site, settings, workspace, database, session, queue, mode
+):
+    tenant_id, project_id = workspace["tenant_id"], workspace["project_id"]
+    environment_id = bind_site(session, workspace, settings, site.base_url)
+    before = "human_policy:\n  mode: before\n" if mode == "before" else ""
+    challenge = (
+        "human_policy:\n  mode: on_challenge\n  resume_condition:\n    kind: page_contains\n    expected: Ready\n"
+        if mode == "on_challenge"
+        else ""
+    )
+    markdown = (
+        "# Human challenge\n## Step 1\n```yaml\naction: open\n"
+        'url: "${env.base_url}/human.html"\n' + challenge + "```\n"
+        "## Step 2\n```yaml\naction: assert\ntimeout_ms: 500\n"
+        "condition:\n  kind: page_contains\n  expected: Ready\n" + before + "```\n"
+    )
+    saved = CaseService(settings).create(
+        tenant_id=tenant_id,
+        project_id=project_id,
+        name=f"human-{mode}",
+        markdown=markdown,
+        dsl_version="1.0",
+        title="Human challenge",
+        created_by=workspace["engineer_user_id"],
+    )
+
+    def until(read):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            result = read()
+            if result:
+                return result
+            time.sleep(0.05)
+        raise AssertionError("the human-control state did not become ready")
+
+    supervisor = Supervisor(settings, queue=queue, announce=True).start()
+    try:
+        wait_for_quiet(supervisor, queue, timeout=90)
+        assert compile_of(saved["revision_id"], tenant_id=tenant_id, database=database)["status"] == "SUCCEEDED"
+        execution = ExecutionService(settings).create(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            case_id=saved["case_id"],
+            environment_id=environment_id,
+            requested_by=workspace["engineer_user_id"],
+        )
+
+        def active_task():
+            with database.session(tenant_id) as scope:
+                return HumanTaskRepository(scope, tenant_id).active_for(execution.id)
+
+        task = until(active_task)
+        with database.session(tenant_id) as scope:
+            HumanTaskRepository(scope, tenant_id).claim(
+                task.id, actor_id=workspace["admin_user_id"], control_ttl_seconds=60
+            )
+        plane = get_control_plane()
+        frame = until(lambda: plane.latest_frame(task.id))
+        payload = {"operation": "click", "x": 60, "y": 25, "sequence": 1, "frame_id": frame["frame_id"]}
+        with database.session(tenant_id) as scope:
+            command = CommandRepository(scope, tenant_id).enqueue(
+                project_id=project_id,
+                execution_id=execution.id,
+                command_type="CONTROL",
+                dedupe_key="complete-challenge",
+                requested_by=workspace["admin_user_id"],
+                payload=payload,
+                human_task_id=task.id,
+            )
+        assert plane.deliver(task.id, {**payload, "command_id": command.id})
+
+        def processed():
+            with database.session(tenant_id) as scope:
+                row = CommandRepository(scope, tenant_id).by_id(command.id)
+                assert row.status != "REJECTED", row.result
+                return row.status == "PROCESSED"
+
+        until(processed)
+        with database.session(tenant_id) as scope:
+            HumanTaskRepository(scope, tenant_id).request_resume(task.id, actor_id=workspace["admin_user_id"])
+            CommandRepository(scope, tenant_id).enqueue(
+                project_id=project_id,
+                execution_id=execution.id,
+                command_type="RESUME",
+                dedupe_key="resume-challenge",
+                requested_by=workspace["admin_user_id"],
+                payload={"step_completed": False},
+                human_task_id=task.id,
+            )
+        wait_for_quiet(supervisor, queue, timeout=90)
+    finally:
+        supervisor.stop()
+    done = conclude(settings, database, tenant_id, execution.id, outcome=Outcome.PASSED.value)
+    assert done.evidence_mode == "SENSITIVE"
+    assert done.human_ms >= 500
+    with database.session(tenant_id) as scope:
+        assert HumanTaskRepository(scope, tenant_id).by_id(task.id).status == "COMPLETED"
+    assert not (settings.scratch_dir / execution.id).exists()

@@ -343,6 +343,9 @@ class RunContext:
     dispatch_hook: Any = None
     #: Called before the first locator attempt of a step that must pause for a human (§7.3).
     human_hook: Any = None
+    #: Cumulative human pauses are excluded from action/active budgets, never from the hard limit.
+    human_waited_ms: int = 0
+    hard_deadline_ms: float | None = None
 
     def resolve(self, spec: ValueSpec) -> ResolvedValue:
         return resolve_value(spec, self.values, self.variables)
@@ -430,6 +433,10 @@ class MissingValue(Exception):
     @property
     def looks_secret(self) -> bool:
         return any(marker in self.name.lower() for marker in _SECRET_MARKERS)
+
+
+class RunTermination(Exception):
+    """A worker hook decided the run's conclusion; executors must let the worker handle it."""
 
 
 class HumanRequired(Exception):

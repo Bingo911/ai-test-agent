@@ -12,7 +12,6 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
-    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -21,7 +20,6 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    Text,
     UniqueConstraint,
     func,
 )
@@ -48,6 +46,8 @@ from ..domain.enums import (
     UploadStatus,
 )
 from .base import Base, UTCDateTime, new_id, utcnow
+from .encrypted_types import EncryptedJSON as JSON
+from .encrypted_types import EncryptedText as Text
 
 STATUSES = [item.value for item in ExecutionStatus]
 OUTCOMES = [item.value for item in Outcome]

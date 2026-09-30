@@ -122,6 +122,7 @@ class ExecutionWorker:
         _enter_run()
         try:
             context = self._new_context(execution, epoch, tenant_id)
+            context.hard_deadline_ms = hard_deadline
             keeper = LeaseKeeper(
                 execution_id=execution_id,
                 tenant_id=tenant_id,
@@ -163,7 +164,7 @@ class ExecutionWorker:
                 error_code=result.error_code,
                 error_detail=result.detail,
                 artifact_status=self._artifact_status(execution, tenant_id, bundle),
-                extra={"active_ms": int(monotonic_ms() - started_monotonic)},
+                extra={"active_ms": max(0, int(monotonic_ms() - started_monotonic) - context.human_waited_ms)},
             )
             return {"execution_id": execution_id, "outcome": result.outcome, "error_code": result.error_code}
         except HumanGateError as failure:
@@ -485,6 +486,7 @@ class ExecutionWorker:
 
             self._start_step(execution, row.step_id, epoch=int(context.lease_epoch), step=step)
             deadline = min(active_deadline, hard_deadline, monotonic_ms() + self._step_budget_ms(step, plan))
+            waited_before = context.human_waited_ms
             result = await self.executor.execute_step(session, step, context, deadline_ms=deadline)
             completed_by_human = result.status == StepStatus.WAIT_HUMAN.value
             if gate is not None and result.ok:
@@ -493,6 +495,7 @@ class ExecutionWorker:
                     await gate.after_step(step, result)
                 except HumanRequired:
                     completed_by_human = True
+            active_deadline += context.human_waited_ms - waited_before
             await self._persist_step(execution, step, result, passed_by_human=completed_by_human)
             statuses.append(StepStatus.PASSED if completed_by_human else StepStatus(result.status))
             if completed_by_human:
@@ -510,7 +513,7 @@ class ExecutionWorker:
         outcome = derive_outcome(
             statuses,
             cancelled=result.status == StepStatus.CANCELLED.value,
-            timed_out=False,
+            timed_out=result.failure_kind == "timeout",
             error_code=None,
         )
         error_code = KIND_TO_ERROR.get(

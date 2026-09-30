@@ -186,14 +186,15 @@ def compile_step(
                 ]
                 continue
             return AiStepResult(None, None, diagnostics)
+        attempt_diagnostics = DiagnosticList()
         normalized = normalize_step(
             candidate,
             declared_variables=set(case.variables),
             vision_allowed=vision_allowed,
-            diagnostics=diagnostics,
+            diagnostics=attempt_diagnostics,
         )
-        if normalized is None or diagnostics.has_errors:
-            problems = [item.message for item in diagnostics.errors()] or ["Step could not be normalized"]
+        if normalized is None or attempt_diagnostics.has_errors:
+            problems = [item.message for item in attempt_diagnostics.errors()] or ["Step could not be normalized"]
             last_problems = problems
             if attempt == 0:
                 messages = [
@@ -206,7 +207,9 @@ def compile_step(
                     },
                 ]
                 continue
+            diagnostics.extend(attempt_diagnostics)
             return AiStepResult(None, None, diagnostics)
+        diagnostics.extend(attempt_diagnostics)
         diagnostics[:] = [item for item in diagnostics if item.severity != "INFO"]
         review_item = {
             "step_id": step.step_id,

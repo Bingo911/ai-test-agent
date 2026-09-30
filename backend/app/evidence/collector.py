@@ -248,7 +248,7 @@ class EvidenceCollector:
         wanted_full_page = full_page and self.full_page_allowed
         self.mask_failed = False
         masked = await self._apply_field_masks(page) if self.mask_fields else 0
-        if masked < 0 and sensitive:
+        if masked < 0:
             # Without verified masking a screenshot can carry a password or OTP, and §12.1 says an
             # un-purgeable file must not be stored rather than stored as-is.
             self.note_capture_error(f"screenshot '{name}' skipped: secret fields could not be masked")
