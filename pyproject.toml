@@ -22,6 +22,8 @@ dependencies = [
     "boto3>=1.35,<2.0",
     "cryptography>=44.0,<51.0",
     "PyJWT[crypto]>=2.10,<3.0",
+    # FastAPI raises while importing the upload routes without this; it is not a transitive dependency.
+    "python-multipart>=0.0.20,<0.2",
 ]
 
 [project.optional-dependencies]
