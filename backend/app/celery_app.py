@@ -64,13 +64,29 @@ def build_celery_app(settings: Settings | None = None) -> Celery:
 
 
 @worker_process_init.connect
+def _confirm_structure(**_: Any) -> None:
+    """Confirm the database this child runs on has the structure this build declares (§13.6, AC-25).
+
+    Development brings it up under the advisory lock; production only reads the version the deploy job left
+    and refuses to start when that answer is not this build's. No seeding here: a Worker has no business
+    creating a tenant.
+    """
+    from .db.bootstrap import bootstrap_runtime
+
+    bootstrap_runtime(get_settings(), seed=False)
+
+
+@worker_process_init.connect
 def _announce(**_: Any) -> None:
     """Each prefork child says it exists; a child holds exactly one browser slot (§9.3)."""
-    from .orchestrator.heartbeat import WorkerAnnouncer
+    from ..orchestrator.heartbeat import WorkerAnnouncer
     from .workers.execution import active_run_count, default_worker_id
 
     _announcers[os.getpid()] = WorkerAnnouncer(
-        worker_id=default_worker_id(), capacity=1, active_count=active_run_count
+        worker_id=default_worker_id(),
+        capacity=1,
+        active_count=active_run_count,
+        roles=get_settings().worker_role_list,
     ).start()
 
 

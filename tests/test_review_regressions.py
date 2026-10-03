@@ -194,6 +194,38 @@ def test_three_prose_steps_compile_with_the_default_compiler_budget(settings, mo
     assert AiAdapter(settings, purpose="vision").max_calls == settings.ai_max_calls_per_run
 
 
+def test_an_assertion_may_expect_a_variable_the_case_declares(settings):
+    """§5.3 compares against the *resolved* expected, so `${vars.*}` is a legal assertion input.
+
+    The run either supplies the variable or fails with `VARIABLE_MISSING`; a declared variable can never
+    quietly assert against an empty string, which is the only thing the empty-literal rule protects.
+    """
+    markdown = (
+        "---\nvariables:\n  keyword:\n    type: string\n    required: true\n---\n"
+        "# Case\n## Step 1\n```yaml\naction: assert\ncondition:\n"
+        '  kind: page_contains\n  expected: "${vars.keyword}"\n```'
+    )
+    compiled = compile_revision(markdown, revision_id="revision", settings=settings)
+    assert compiled.status == "SUCCEEDED", compiled.diagnostics
+    assert compiled.ir["steps"][0]["condition"]["expected"] == {
+        "kind": "variable",
+        "namespace": "vars",
+        "key": "keyword",
+    }
+
+
+def test_an_assertion_still_needs_something_to_compare_against(settings):
+    """The guard the fix keeps: an empty expected is an assertion that can never hold."""
+    for expected in ('""', "null"):
+        markdown = (
+            "# Case\n## Step 1\n```yaml\naction: assert\ncondition:\n"
+            f"  kind: page_contains\n  expected: {expected}\n```"
+        )
+        compiled = compile_revision(markdown, revision_id="revision", settings=settings)
+        assert compiled.status == "FAILED", (expected, compiled.diagnostics)
+        assert {item["code"] for item in compiled.diagnostics} == {"CONDITION_EXPECTED_REQUIRED"}, compiled.diagnostics
+
+
 def test_a_valid_ai_repair_does_not_keep_the_previous_normalization_error(settings, monkeypatch):
     adapter = ai(
         settings,
@@ -206,6 +238,95 @@ def test_a_valid_ai_repair_does_not_keep_the_previous_normalization_error(settin
     assert result.status == "NEEDS_REVIEW", result.diagnostics
     assert adapter.usage.calls == 2
     assert not any(item["severity"] == "ERROR" for item in result.diagnostics)
+
+
+def test_a_model_that_echoes_the_step_id_it_was_shown_still_compiles(settings, monkeypatch):
+    """The contract the model is shown names `id`, so echoing it is the model following instructions.
+
+    It failed once, as `Unsupported field 'id' for assert`: the normalizer takes the step id from the heading
+    and treats any other key as DSL noise. A reply that is otherwise perfect then needed a repair round whose
+    instruction was "drop the field the prompt told you to include", and the compile ended FAILED.
+    """
+    adapter = ai(
+        settings,
+        monkeypatch,
+        [{"id": "s1", "action": "assert", "condition": {"kind": "page_contains", "expected": "Welcome"}}],
+    )
+    result = compile_revision(
+        "# Case\n## Step 1\n确认页面上出现了 Welcome", revision_id="revision", settings=settings, ai_adapter=adapter
+    )
+    assert result.status == "NEEDS_REVIEW", result.diagnostics
+    assert result.ir["steps"][0]["id"] == "s1"
+    assert adapter.usage.calls == 1, "accepted as it stood, with no repair round spent"
+
+
+def test_a_model_answer_naming_a_different_step_is_still_refused(settings, monkeypatch):
+    """Consuming the echo is not the same as trusting it: a reply about another step is a wrong reply."""
+    adapter = ai(
+        settings,
+        monkeypatch,
+        [
+            {"id": "s2", "action": "assert", "condition": {"kind": "page_contains", "expected": "Welcome"}},
+            {"id": "s1", "action": "assert", "condition": {"kind": "page_contains", "expected": "Welcome"}},
+        ],
+    )
+    result = compile_revision(
+        "# Case\n## Step 1\n确认页面上出现了 Welcome", revision_id="revision", settings=settings, ai_adapter=adapter
+    )
+    assert result.status == "NEEDS_REVIEW", result.diagnostics
+    assert adapter.usage.calls == 2
+    assert result.ir["steps"][0]["id"] == "s1"
+
+
+def test_a_prose_step_the_model_cannot_compile_fails_the_case_instead_of_shortening_it(settings, monkeypatch):
+    """A dropped prose step used to compile SUCCEEDED with one step fewer - and that IR was runnable.
+
+    Both attempts failing returned only the INFO notes from each try, so the pipeline saw no error, skipped
+    the step, and shipped a shorter case marked `deterministic`. The live model produced exactly this shape
+    when it wrote `{"action": "assert", "assert": {...}}`, which is why the guard has to be an error and not
+    a guess.
+    """
+    rejected = {"action": "assert", "assert": {"kind": "page_contains", "expected": "Welcome"}}
+    adapter = ai(settings, monkeypatch, [rejected, rejected])
+    result = compile_revision(
+        "# Case\n## Step 1\n```yaml\naction: open\nurl: https://example.com\n```\n"
+        "## Step 2\n确认页面上出现了 Welcome",
+        revision_id="revision",
+        settings=settings,
+        ai_adapter=adapter,
+    )
+    assert result.status == "FAILED", result.diagnostics
+    errors = [item for item in result.diagnostics if item["severity"] == "ERROR"]
+    assert [item["code"] for item in errors] == ["AI_OUTPUT_INVALID"], errors
+    assert errors[0]["step_id"] == "s2"
+    assert "after one repair attempt" in errors[0]["message"]
+    assert adapter.usage.calls == 2
+    # Two calls went out, so two calls must be on the record: filing this failure under `deterministic`
+    # would let a compile that reached a model be read as one that never needed to.
+    assert result.compiler_mode == "ai_assisted"
+
+
+def test_a_prose_step_whose_model_call_never_returns_is_still_an_assisted_compile(settings, monkeypatch):
+    """The mode follows the hand-off, not the response.
+
+    Counting successful calls made a provider that was reached and then failed read as `deterministic`, which
+    is the one case where the difference matters: the step's text did leave the platform, and a compile filed
+    as local says it did not.
+    """
+    from backend.app.ai.adapter import AiUnavailable
+
+    def died(_messages):
+        raise AiUnavailable("the provider did not answer")
+
+    adapter = ai(settings, monkeypatch, [])
+    monkeypatch.setattr(adapter, "chat_json", died)
+    result = compile_revision(
+        "# Case\n## Step 1\n确认页面上出现了 Welcome", revision_id="revision", settings=settings, ai_adapter=adapter
+    )
+    assert result.status == "FAILED", result.diagnostics
+    assert [item["code"] for item in result.diagnostics if item["severity"] == "ERROR"] == ["AI_UNAVAILABLE"]
+    assert result.compiler_mode == "ai_assisted"
+    assert adapter.usage.calls == 0
 
 
 def test_analysis_reads_a_dom_prefix_and_the_tail_of_large_json_rings(settings, database, tmp_path):

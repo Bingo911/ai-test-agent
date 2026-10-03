@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from ..config import Settings, get_settings
-from ..db.base import new_id
+from ..db.base import Database, get_database, new_id
 from ..db.models import EnvironmentRevision, TestExecution
 from ..domain.enums import AnalysisStatus, ArtifactStatus, CompileStatus, ExecutionStatus, Outcome, Sensitivity
 from ..domain.errors import ApiError, ErrorCode
@@ -33,8 +33,14 @@ TRIGGER_SCHEDULED = "scheduled"
 
 
 class ExecutionService:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, database: Database | None = None) -> None:
         self.settings = settings or get_settings()
+        self._database = database
+
+    @property
+    def database(self) -> Database:
+        """The pool this service was handed; the process default only serves standalone callers."""
+        return self._database if self._database is not None else get_database()
 
     # ------------------------------------------------------------------- create
 
@@ -55,97 +61,29 @@ class ExecutionService:
         trigger: str = TRIGGER_MANUAL,
         retry_of_execution_id: str | None = None,
     ) -> TestExecution:
-        """Freeze the inputs, store the run and wake the scheduler — atomically."""
-        from ..db.base import get_database
+        """Freeze the inputs, store the run and wake the scheduler — atomically.
 
-        database = get_database()
-        with database.session(tenant_id) as session:
-            cases = CaseRepository(session, tenant_id)
-            case = cases.by_id(case_id)
-            if case is None:
-                raise ApiError(ErrorCode.NOT_FOUND, "Case not found in this tenant")
-            revision_id = revision_id or case.current_revision_id
-            if not revision_id:
-                raise ApiError(ErrorCode.SEMANTIC_ERROR, "The case has no revision to run")
-            revision = cases.require_revision(revision_id)
-            if revision.case_id != case.id:
-                raise ApiError(ErrorCode.SEMANTIC_ERROR, "That revision belongs to a different case")
-
-            compiles = CompileRepository(session, tenant_id)
-            if compile_artifact_id:
-                compile_artifact = compiles.by_id(compile_artifact_id)
-                if compile_artifact is None or compile_artifact.revision_id != revision.id:
-                    raise ApiError(
-                        ErrorCode.NOT_FOUND,
-                        "That compile artifact is not a product of this revision",
-                        details={"compile_artifact_id": compile_artifact_id},
-                    )
-                if not _is_executable(compile_artifact):
-                    raise ApiError(
-                        ErrorCode.COMPILE_REVIEW_REQUIRED,
-                        "This compile artifact needs a human confirmation before it can run"
-                        if compile_artifact.status == CompileStatus.NEEDS_REVIEW.value
-                        else "This compile did not produce an executable IR",
-                        details={"compile_artifact_id": compile_artifact.id, "status": compile_artifact.status},
-                    )
-            else:
-                compile_artifact = compiles.executable_for_revision(revision.id)
-            if compile_artifact is None:
-                raise ApiError(
-                    ErrorCode.EXECUTION_NOT_RUNNABLE,
-                    "Compile an executable IR for this revision before running it",
-                    details={"revision_id": revision.id},
-                )
-            ir_payload = dict(compile_artifact.ir or {})
-            ir = _validate_ir(ir_payload)
-            environment, environment_revision = self._environment(
+        The transaction belongs to the caller: an atomic command has to commit the run, its steps, the
+        outbox event and its audit entry together with the idempotency reservation, so this wrapper only
+        supplies a session of its own for callers that have none.
+        """
+        with self.database.session(tenant_id) as session:
+            execution = create_execution(
                 session,
+                self.settings,
                 tenant_id,
-                project_id,
-                environment_id,
-                environment_revision_id,
-            )
-            self._check_variables(ir, run_variables or {})
-            browser = self._browser(browser, environment_revision)
-            # A request or environment may pick NORMAL, but an IR that fills secret fields cannot (§10.4).
-            mode = SecretStore.evidence_mode_for(
-                ir_payload, requested=self._evidence_mode(evidence_mode, environment_revision)
-            )
-
-            executions = ExecutionRepository(session, tenant_id)
-            execution = executions.create(
                 project_id=project_id,
-                case_id=case.id,
-                revision_id=revision.id,
-                compile_artifact_id=compile_artifact.id,
-                environment_id=environment.id if environment else None,
-                environment_revision_id=environment_revision.id,
-                ir=ir_payload,
-                ir_digest=compile_artifact.ir_digest or ir.digest(),
-                snapshot=build_snapshot(
-                    case=case,
-                    revision=revision,
-                    environment_revision=environment_revision,
-                    project=AccessRepository(session, tenant_id).project(tenant_id, project_id),
-                    run_variables=run_variables,
-                    evidence_mode=mode,
-                ),
+                case_id=case_id,
+                revision_id=revision_id,
+                environment_id=environment_id,
+                environment_revision_id=environment_revision_id,
+                compile_artifact_id=compile_artifact_id,
                 requested_by=requested_by,
+                run_variables=run_variables,
+                evidence_mode=evidence_mode,
                 browser=browser,
-                evidence_mode=mode,
                 trigger=trigger,
                 retry_of_execution_id=retry_of_execution_id,
-            )
-            # The step rows mirror the IR document order so a reader sees the whole plan up front.
-            executions.add_steps(execution, [dict(step) for step in (ir_payload.get("steps") or [])])
-            executions.transition(
-                execution.id, to_status=ExecutionStatus.QUEUED.value, event_payload={"trigger": trigger}
-            )
-            OutboxRepository(session, tenant_id).enqueue(
-                aggregate_id=execution.id,
-                event_type=EXECUTION_QUEUED,
-                payload={"execution_id": execution.id, "tenant_id": tenant_id, "project_id": project_id},
-                discriminator=f"{EXECUTION_QUEUED}:{execution.id}",
             )
             session.commit()
             return execution
@@ -230,9 +168,7 @@ class ExecutionService:
     # -------------------------------------------------------------- observation
 
     def get(self, *, tenant_id: str, execution_id: str) -> TestExecution:
-        from ..db.base import get_database
-
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             return ExecutionRepository(session, tenant_id).load(execution_id)
 
     def list(
@@ -249,9 +185,7 @@ class ExecutionService:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[TestExecution], int]:
-        from ..db.base import get_database
-
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             return ExecutionRepository(session, tenant_id).list(
                 project_id=project_id,
                 case_id=case_id,
@@ -268,9 +202,7 @@ class ExecutionService:
         self, *, tenant_id: str, execution_id: str, after_seq: int = 0, limit: int = 200
     ) -> list[dict[str, Any]]:
         """The journal the SSE stream replays from (§13.4)."""
-        from ..db.base import get_database
-
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             rows = ExecutionRepository(session, tenant_id).events_after(execution_id, after_seq, limit=limit)
             return [
                 {
@@ -284,9 +216,7 @@ class ExecutionService:
 
     def probe(self, *, tenant_id: str, execution_id: str) -> dict[str, Any]:
         """The two numbers a stream needs per poll, without loading the IR or the snapshot."""
-        from ..db.base import get_database
-
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repo = ExecutionRepository(session, tenant_id)
             execution = repo.load(execution_id)
             return {
@@ -303,25 +233,10 @@ class ExecutionService:
         self, *, tenant_id: str, execution_id: str, requested_by: str | None, reason: str = "requested"
     ) -> TestExecution:
         """Mark the intent only: whoever holds the lease stops at the next step boundary (§9.1)."""
-        from ..db.base import get_database
-
-        with get_database().session(tenant_id) as session:
-            repo = ExecutionRepository(session, tenant_id)
-            execution = repo.request_cancel(execution_id, requested_by=requested_by, reason=reason)
-            if execution.status == ExecutionStatus.FINALIZING.value:
-                # `request_cancel` only reaches FINALIZING when no worker ever claimed the run, so
-                # there is nobody to hand the conclusion to: close it now instead of leaving it to
-                # the reconciler's archive deadline.
-                finalize(
-                    session,
-                    execution,
-                    outcome=Outcome.CANCELLED.value,
-                    error_code=ErrorCode.CANCELLED.value,
-                    artifact_status=ArtifactStatus.COMPLETE.value,
-                )
-                release_for_execution(
-                    session, execution.id, cleanup_confirmed=True, reason="cancelled before it started"
-                )
+        with self.database.session(tenant_id) as session:
+            execution = request_cancellation(
+                session, tenant_id, execution_id, requested_by=requested_by, reason=reason
+            )
             session.commit()
             return execution
 
@@ -360,9 +275,7 @@ class ExecutionService:
 
     def analyze(self, *, tenant_id: str, execution_id: str, requested_by: str | None = None) -> str:
         """Re-analysis asks the model again without re-running the browser (§12.3)."""
-        from ..db.base import get_database
-
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repo = ExecutionRepository(session, tenant_id)
             execution = repo.load(execution_id)
             if execution.status != ExecutionStatus.FINISHED.value:
@@ -385,6 +298,151 @@ class ExecutionService:
             return execution.id
 
 
+def create_execution(
+    session,
+    settings: Settings,
+    tenant_id: str,
+    *,
+    project_id: str,
+    case_id: str,
+    revision_id: str | None = None,
+    environment_id: str | None = None,
+    environment_revision_id: str | None = None,
+    compile_artifact_id: str | None = None,
+    requested_by: str | None = None,
+    run_variables: dict[str, Any] | None = None,
+    evidence_mode: str | None = None,
+    browser: str | None = None,
+    trigger: str = TRIGGER_MANUAL,
+    retry_of_execution_id: str | None = None,
+    expected_ir_digest: str | None = None,
+    run_ai: dict[str, Any] | None = None,
+) -> TestExecution:
+    """Freeze the inputs, write the run and queue it, in the transaction the caller already holds.
+
+    Nothing here commits. The execution row, its step projections, the `execution.queued` event and the
+    idempotency reservation that answers for them are one unit: committed separately, a replay could
+    report a run whose queue entry never existed (§9.3.5).
+    """
+    service = ExecutionService(settings)
+    cases = CaseRepository(session, tenant_id)
+    case = cases.by_id(case_id)
+    if case is None:
+        raise ApiError(ErrorCode.NOT_FOUND, "Case not found in this tenant")
+    revision_id = revision_id or case.current_revision_id
+    if not revision_id:
+        raise ApiError(ErrorCode.SEMANTIC_ERROR, "The case has no revision to run")
+    revision = cases.require_revision(revision_id)
+    if revision.case_id != case.id:
+        raise ApiError(ErrorCode.SEMANTIC_ERROR, "That revision belongs to a different case")
+
+    compiles = CompileRepository(session, tenant_id)
+    if compile_artifact_id:
+        compile_artifact = compiles.by_id(compile_artifact_id)
+        if compile_artifact is None or compile_artifact.revision_id != revision.id:
+            raise ApiError(
+                ErrorCode.NOT_FOUND,
+                "That compile artifact is not a product of this revision",
+                details={"compile_artifact_id": compile_artifact_id},
+            )
+        if not _is_executable(compile_artifact):
+            raise ApiError(
+                ErrorCode.COMPILE_REVIEW_REQUIRED,
+                "This compile artifact needs a human confirmation before it can run"
+                if compile_artifact.status == CompileStatus.NEEDS_REVIEW.value
+                else "This compile did not produce an executable IR",
+                details={"compile_artifact_id": compile_artifact.id, "status": compile_artifact.status},
+            )
+    else:
+        compile_artifact = compiles.executable_for_revision(revision.id)
+    if compile_artifact is None:
+        raise ApiError(
+            ErrorCode.EXECUTION_NOT_RUNNABLE,
+            "Compile an executable IR for this revision before running it",
+            details={"revision_id": revision.id},
+        )
+    ir_payload = dict(compile_artifact.ir or {})
+    ir = _validate_ir(ir_payload)
+    frozen_digest = compile_artifact.ir_digest or ir.digest()
+    if expected_ir_digest is not None and frozen_digest != expected_ir_digest:
+        # The caller named the IR it reviewed; running a different one would silently drop that review.
+        raise ApiError(
+            ErrorCode.COMPILE_STALE_DIGEST,
+            "The compiled IR is not the one this run was asked to execute",
+            details={"compile_artifact_id": compile_artifact.id, "ir_digest": frozen_digest},
+        )
+    environment, environment_revision = service._environment(
+        session, tenant_id, project_id, environment_id, environment_revision_id
+    )
+    service._check_variables(ir, run_variables or {})
+    chosen_browser = service._browser(browser, environment_revision)
+    # A request or environment may pick NORMAL, but an IR that fills secret fields cannot (§10.4).
+    mode = SecretStore.evidence_mode_for(
+        ir_payload, requested=service._evidence_mode(evidence_mode, environment_revision)
+    )
+
+    executions = ExecutionRepository(session, tenant_id)
+    execution = executions.create(
+        project_id=project_id,
+        case_id=case.id,
+        revision_id=revision.id,
+        compile_artifact_id=compile_artifact.id,
+        environment_id=environment.id if environment else None,
+        environment_revision_id=environment_revision.id,
+        ir=ir_payload,
+        ir_digest=frozen_digest,
+        snapshot=build_snapshot(
+            case=case,
+            revision=revision,
+            environment_revision=environment_revision,
+            project=AccessRepository(session, tenant_id).project(tenant_id, project_id),
+            run_variables=run_variables,
+            evidence_mode=mode,
+            run_ai=run_ai,
+        ),
+        requested_by=requested_by,
+        browser=chosen_browser,
+        evidence_mode=mode,
+        trigger=trigger,
+        retry_of_execution_id=retry_of_execution_id,
+    )
+    # The step rows mirror the IR document order so a reader sees the whole plan up front.
+    executions.add_steps(execution, [dict(step) for step in (ir_payload.get("steps") or [])])
+    executions.transition(execution.id, to_status=ExecutionStatus.QUEUED.value, event_payload={"trigger": trigger})
+    OutboxRepository(session, tenant_id).enqueue(
+        aggregate_id=execution.id,
+        event_type=EXECUTION_QUEUED,
+        payload={"execution_id": execution.id, "tenant_id": tenant_id, "project_id": project_id},
+        discriminator=f"{EXECUTION_QUEUED}:{execution.id}",
+    )
+    session.flush()
+    return execution
+
+
+def request_cancellation(
+    session, tenant_id: str, execution_id: str, *, requested_by: str | None, reason: str = "requested"
+) -> TestExecution:
+    """Mark the intent to stop, in the caller's transaction (§9.1).
+
+    Whoever holds the lease is the one that stops, at the next step boundary. A run that no worker ever
+    claimed has nobody to hand the conclusion to, so it is closed here instead of waiting for the
+    reconciler's archive deadline.
+    """
+    repo = ExecutionRepository(session, tenant_id)
+    execution = repo.request_cancel(execution_id, requested_by=requested_by, reason=reason)
+    if execution.status == ExecutionStatus.FINALIZING.value:
+        finalize(
+            session,
+            execution,
+            outcome=Outcome.CANCELLED.value,
+            error_code=ErrorCode.CANCELLED.value,
+            artifact_status=ArtifactStatus.COMPLETE.value,
+        )
+        release_for_execution(session, execution.id, cleanup_confirmed=True, reason="cancelled before it started")
+    session.flush()
+    return execution
+
+
 def _validate_ir(payload: dict[str, Any]) -> TestIR:
     try:
         return TestIR.model_validate(payload)
@@ -397,6 +455,22 @@ def _is_executable(artifact: Any) -> bool:
     if artifact.status == CompileStatus.SUCCEEDED.value:
         return True
     return artifact.status == CompileStatus.NEEDS_REVIEW.value and artifact.confirmed_at is not None
+
+
+def execution_result(execution: TestExecution) -> dict[str, Any]:
+    """What a run request decided, in fields that mean the same thing to every adapter (§9.4).
+
+    Deliberately without the REST links: the idempotency record stores this, and a download or stream URL
+    minted for one caller must never be handed to the next one that replays the key.
+    """
+    return {
+        "id": execution.id,
+        "status": execution.status,
+        "outcome": execution.outcome,
+        "project_id": execution.project_id,
+        "case_id": execution.case_id,
+        "trigger": execution.trigger,
+    }
 
 
 def execution_summary(execution: TestExecution) -> dict[str, Any]:

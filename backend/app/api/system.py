@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from sqlalchemy import select
 
-from ..db.base import get_database
 from ..domain.enums import Permission
 from ..executors.playwright.adapter import PlaywrightExecutor
 from ..ir.models import COMPILER_VERSION
 from ..observability import get_logger
-from .deps import Ctx
+from .deps import Ctx, app_database
 
 log = get_logger(__name__)
 
@@ -32,10 +31,14 @@ FEATURE_FLAGS = {
 
 
 @router.get("/health")
-def health() -> dict[str, object]:
-    """Liveness plus a database round-trip; a deployment behind a load balancer reads this (§15.4)."""
+def health(request: Request) -> dict[str, object]:
+    """Liveness plus a database round-trip; a deployment behind a load balancer reads this (§15.4).
+
+    The probe uses the pool this app was built with, so a second app instance with its own database
+    reports on its own database instead of on whichever pool the process registered first.
+    """
     try:
-        with get_database().session() as session:
+        with app_database(request.app).session() as session:
             session.execute(select(1))
         database = "ok"
     except Exception as exc:

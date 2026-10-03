@@ -8,14 +8,16 @@ from fastapi import APIRouter, Depends, File, Form, Header, Query, Response, Upl
 from pydantic import BaseModel, Field, StringConstraints
 from sqlalchemy import select
 
+from ..application import authorization
+from ..application import cases as case_commands
+from ..application import compilations as compile_commands
 from ..db.models import CaseTag, Tag
 from ..domain.enums import CompileStatus, Permission
 from ..domain.errors import ApiError, ErrorCode
-from ..ir.models import COMPILER_VERSION
 from ..repositories.cases import CaseRepository, CompileRepository, TagRepository
 from ..repositories.resources import AttachmentRepository
 from ..services.attachments import AttachmentService, attachment_payload
-from ..services.cases import CaseService, compile_now
+from ..services.cases import CaseService
 from .deps import Ctx, Page, etag, idempotent, page_envelope, page_params, parse_if_match
 
 router = APIRouter(tags=["cases"])
@@ -77,11 +79,16 @@ def list_cases(
 ) -> dict[str, Any]:
     ctx.project(project_id, permission=Permission.CASE_READ)
     with ctx.session() as session:
-        tags = TagRepository(session, ctx.tenant_id).for_project(project_id)
+        # An absent `tag` means "no tag filter", not "every tag in the project": the difference is
+        # whether an untagged case appears in the list at all.
         wanted = {item.lower() for item in (tag or [])}
-        tag_ids = [row.id for row in tags if not wanted or row.name.lower() in wanted]
-        if wanted and len(tag_ids) != len(wanted):
-            raise ApiError(ErrorCode.VALIDATION_ERROR, "One of the requested tags does not exist in this project")
+        tag_ids: list[str] = []
+        if wanted:
+            rows = TagRepository(session, ctx.tenant_id).for_project(project_id)
+            by_name = {row.name.lower(): row.id for row in rows}
+            if wanted - set(by_name):
+                raise ApiError(ErrorCode.VALIDATION_ERROR, "One of the requested tags does not exist in this project")
+            tag_ids = sorted(by_name[name] for name in wanted)
         rows, total = CaseRepository(session, ctx.tenant_id).list(
             project_id=project_id,
             tag_ids=tag_ids,
@@ -103,34 +110,17 @@ def create_case(
     idempotency_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     """Saving a case queues a compile; the request never waits for a model call (§6.1)."""
-    ctx.project(project_id, permission=Permission.CASE_WRITE)
-    payload = body.model_dump(mode="json")
-
-    def action() -> tuple[str, dict[str, Any]]:
-        result = CaseService(ctx.settings).create(
-            tenant_id=ctx.tenant_id,
+    with ctx.unit_of_work(write=True) as uow:
+        result = case_commands.create_case(
+            uow,
             project_id=project_id,
             name=body.name,
             markdown=body.markdown,
             dsl_version=body.dsl_version,
             title=body.title,
-            created_by=ctx.actor_id,
             tags=body.tags,
+            idempotency_key=idempotency_key,
         )
-        with ctx.session() as session:
-            ctx.audit(
-                session,
-                operation="case.create",
-                resource_type="case",
-                resource_id=str(result["case_id"]),
-                project_id=project_id,
-                detail={"revision_id": result["revision_id"], "revision_no": result["revision_no"]},
-            )
-        return str(result["case_id"]), result
-
-    result = idempotent(
-        ctx, route=f"POST /projects/{project_id}/cases", key=idempotency_key, payload=payload, action=action
-    )
     response.headers["Location"] = f"/api/v1/cases/{result['case_id']}"
     return result
 
@@ -158,7 +148,7 @@ async def import_case(
         raise ApiError(ErrorCode.VALIDATION_ERROR, "The uploaded case must be UTF-8 encoded text") from exc
     base = (name or (file.filename or "").rsplit(".", 1)[0] or "imported-case").strip()
     tag_list = [item.strip() for item in (tags or "").split(",") if item.strip()]
-    result = CaseService(ctx.settings).create(
+    result = CaseService(ctx.settings, database=ctx.database).create(
         tenant_id=ctx.tenant_id,
         project_id=project_id,
         name=base[:200],
@@ -196,7 +186,7 @@ def get_case(ctx: Ctx, case_id: str, response: Response) -> dict[str, Any]:
             "description": case.description,
             "markdown": revision.markdown if revision else None,
             "current_revision": _revision_payload(revision) if revision else None,
-            "compile": CaseService(ctx.settings).compile_result(
+            "compile": CaseService(ctx.settings, database=ctx.database).compile_result(
                 session, tenant_id=ctx.tenant_id, revision_id=revision.id
             )
             if revision
@@ -216,28 +206,33 @@ def patch_case(
     body: CasePatch,
     if_match: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
-    """Metadata only — the case text is immutable, so an edit is a new revision (§3.2)."""
-    with ctx.session() as session:
-        case = CaseRepository(session, ctx.tenant_id).by_id(case_id)
-        if case is None:
-            raise ApiError(ErrorCode.NOT_FOUND, "Case not found in your tenant")
-    ctx.project(case.project_id, permission=Permission.CASE_WRITE)
-    expected = parse_if_match(if_match)
-    if expected is not None and expected != int(case.row_version or 1):
-        raise ApiError(
-            ErrorCode.VERSION_CONFLICT,
-            "The case changed since you loaded it; reload before editing metadata",
-            details={"current_row_version": int(case.row_version or 1)},
-        )
+    """Metadata only — the case text is immutable, so an edit is a new revision (§3.2).
+
+    One session for the whole edit. `expire_on_commit=False` means a case loaded in a finished session
+    is still readable while detached, and SQLAlchemy accepts writes to it without complaining - so an
+    earlier two-session shape here answered 200 for `name`, `archived` and `tags` while changing nothing.
+    """
     with ctx.session() as session:
         cases = CaseRepository(session, ctx.tenant_id)
+        case = cases.by_id(case_id)
+        if case is None:
+            raise ApiError(ErrorCode.NOT_FOUND, "Case not found in your tenant")
+        authorization.project(session, ctx.call_context(), case.project_id, permission=Permission.CASE_WRITE)
+        expected = parse_if_match(if_match)
+        current = int(case.row_version or 1)
+        if expected is not None and expected != current:
+            raise ApiError(
+                ErrorCode.VERSION_CONFLICT,
+                "The case changed since you loaded it; reload before editing metadata",
+                details={"current_row_version": current},
+            )
         if body.name or body.description:
             cases.rename(case, name=body.name or case.name, description=body.description)
         if body.archived is True:
             cases.archive(case)
         elif body.archived is False:
             case.archived_at = None
-            case.row_version = int(case.row_version or 1) + 1
+            case.row_version = current + 1
         if body.tags is not None:
             TagRepository(session, ctx.tenant_id).set_case_tags(case, body.tags)
         ctx.audit(
@@ -270,23 +265,20 @@ def add_revision(
     case_id: str,
     body: RevisionCreate,
     if_match: Annotated[str | None, Header()] = None,
+    idempotency_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
-    with ctx.session() as session:
-        case = CaseRepository(session, ctx.tenant_id).by_id(case_id)
-        if case is None:
-            raise ApiError(ErrorCode.NOT_FOUND, "Case not found in your tenant")
-        if case.archived_at is not None:
-            raise ApiError(ErrorCode.CASE_ARCHIVED, "An archived case cannot take a new revision")
-    ctx.project(case.project_id, permission=Permission.CASE_WRITE)
-    return CaseService(ctx.settings).add_revision(
-        tenant_id=ctx.tenant_id,
-        case_id=case_id,
-        markdown=body.markdown,
-        dsl_version=body.dsl_version,
-        title=body.title,
-        created_by=ctx.actor_id,
-        expected_row_version=parse_if_match(if_match, required=True),
-    )
+    """`If-Match` is still required; the key is new and optional, so an old client is unaffected (§9.2.1)."""
+    expected = parse_if_match(if_match, required=True)
+    with ctx.unit_of_work(write=True) as uow:
+        return case_commands.add_case_revision(
+            uow,
+            case_id=case_id,
+            markdown=body.markdown,
+            dsl_version=body.dsl_version,
+            title=body.title,
+            expected_row_version=expected,
+            idempotency_key=idempotency_key,
+        )
 
 
 @router.get("/case-revisions/{revision_id}")
@@ -314,46 +306,14 @@ def compile_revision(
     idempotency_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     """202 plus the artifact id: the client polls `GET /compilations/{id}` for the result (§13.1)."""
-    with ctx.session() as session:
-        revision = CaseRepository(session, ctx.tenant_id).require_revision(revision_id)
-        ctx.project(revision.project_id, permission=Permission.CASE_COMPILE)
-        payload = {
-            "revision_id": revision_id,
-            "use_ai": body.use_ai,
-            "force": body.force,
-            "digest": revision.source_digest,
-        }
-
-    def action() -> tuple[str, dict[str, Any]]:
-        with ctx.session() as session:
-            artifact_id = compile_now(
-                session,
-                ctx.tenant_id,
-                project_id=revision.project_id,
-                revision_id=revision.id,
-                created_by=ctx.actor_id,
-                use_ai=body.use_ai,
-                force=body.force,
-            )
-            ctx.audit(
-                session,
-                operation="compile.request",
-                resource_type="compile_artifact",
-                resource_id=artifact_id,
-                project_id=revision.project_id,
-                detail={"revision_id": revision_id, "use_ai": body.use_ai, "force": body.force},
-            )
-            session.commit()
-        return artifact_id, {
-            "compile_artifact_id": artifact_id,
-            "status": CompileStatus.PENDING.value,
-            "revision_id": revision_id,
-            "compiler_version": COMPILER_VERSION,
-        }
-
-    return idempotent(
-        ctx, route=f"POST /case-revisions/{revision_id}/compile", key=idempotency_key, payload=payload, action=action
-    )
+    with ctx.unit_of_work(write=True) as uow:
+        return compile_commands.compile_revision(
+            uow,
+            revision_id=revision_id,
+            use_ai=body.use_ai,
+            force=body.force,
+            idempotency_key=idempotency_key,
+        )
 
 
 @router.get("/compilations/{artifact_id}")
@@ -421,7 +381,7 @@ async def upload_attachment(ctx: Ctx, project_id: str, file: Annotated[UploadFil
     """Store-and-scan in one call; only a CLEAN attachment can be referenced by an `upload` step."""
     ctx.project(project_id, permission=Permission.CASE_WRITE)
     data = await file.read()
-    result = AttachmentService(ctx.settings).store(
+    result = AttachmentService(ctx.settings, database=ctx.database).store(
         tenant_id=ctx.tenant_id,
         project_id=project_id,
         filename=file.filename or "attachment",

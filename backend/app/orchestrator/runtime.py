@@ -81,7 +81,22 @@ class Supervisor:
         from ..workers.execution import active_run_count, default_worker_id
         from .heartbeat import WorkerAnnouncer
 
-        self.announcer = WorkerAnnouncer(worker_id=default_worker_id(), active_count=active_run_count).start()
+        self.announcer = WorkerAnnouncer(
+            worker_id=default_worker_id(), active_count=active_run_count, roles=self._declared_roles()
+        ).start()
+
+    def _declared_roles(self) -> list[str]:
+        """Which queues this process says it consumes.
+
+        An in-process supervisor runs the work itself, so it covers every queue; a Celery deployment
+        announces only what `WORKER_ROLES` names, because the queues on a command line are not visible to
+        the readiness probe and guessing them would report capacity that is not there (§13.5).
+        """
+        from .queue import QUEUES_FOR_TASK
+
+        if self.executes_tasks:
+            return sorted(set(QUEUES_FOR_TASK.values()))
+        return self.settings.worker_role_list
 
     def stop(self, *, timeout: float = 5.0) -> None:
         self._stop.set()

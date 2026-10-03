@@ -7,9 +7,9 @@ blocked by the composite `(tenant_id, id)` foreign keys in the schema.
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.orm import Session
 
 from ..db.base import utcnow
@@ -51,3 +51,18 @@ def json_copy(value: object) -> object:
     if isinstance(value, list):
         return [json_copy(item) for item in value]
     return value
+
+
+def keyset_earlier(first: Any, second: Any, *, after: Any, after_id: Any) -> Any:
+    """The rows strictly after a `ORDER BY first DESC, second DESC` page's last row.
+
+    Written as the expanded `OR` rather than a row-value comparison because SQLite only learned
+    tuple comparison recently and PostgreSQL is the only dialect that has always had it; this form
+    plans the same way on both and cannot silently degrade to a scan.
+    """
+    return or_(first < after, and_(first == after, second < after_id))
+
+
+def keyset_later(first: Any, second: Any, *, after: Any, after_id: Any) -> Any:
+    """The same bound for an `ORDER BY first ASC, second ASC` page, which is what steps use."""
+    return or_(first > after, and_(first == after, second > after_id))

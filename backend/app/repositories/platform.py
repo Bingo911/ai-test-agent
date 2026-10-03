@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import object_session
 
 from ..db.base import coerce_utc, new_id, utcnow
 from ..db.models import (
@@ -22,6 +23,13 @@ from ..db.models import (
 )
 from ..domain.enums import Permission, Role
 from ..domain.errors import ApiError, ErrorCode
+from ..domain.mcp_policy import (
+    McpPolicy,
+    apply_policy_to_settings,
+    merge_policy,
+    read_policy,
+    require_complete_repair,
+)
 from .base import Scoped
 
 
@@ -117,8 +125,15 @@ class IdempotencyRepository(Scoped[IdempotencyRecord]):
         return existing, None
 
     def complete(self, row: IdempotencyRecord, *, resource_id: str, response: dict[str, Any]) -> None:
-        row.resource_id = resource_id
-        row.response = response
+        """Close out a reservation in *this* session, whoever handed the row over.
+
+        The legacy caller reserved in an earlier transaction, so the object it kept is detached by now;
+        writing to a detached row is silently lost, and the key would stay unfinished for the next call
+        to run the action a second time.
+        """
+        target = row if object_session(row) is self.session else self.session.merge(row)
+        target.resource_id = resource_id
+        target.response = response
         self.session.flush()
 
     def release(self, row: IdempotencyRecord) -> None:
@@ -359,7 +374,7 @@ class AccessRepository(Scoped[Project]):
 
     def update_project(
         self,
-        project: Project,
+        project_id: str,
         *,
         display_name: str | None = None,
         description: str | None = None,
@@ -368,7 +383,20 @@ class AccessRepository(Scoped[Project]):
         archived: bool | None = None,
         expected_row_version: int | None = None,
     ) -> Project:
-        """Metadata only: a project's name is its unique key here, so renaming is not an edit (§11.2)."""
+        """Metadata only: a project's name is its unique key here, so renaming is not an edit (§11.2).
+
+        The row is read *here* and locked before it is compared. An object handed in from a finished
+        session is detached, and writing to a detached row answers 200 while changing nothing - and its
+        `row_version` is only a snapshot of what that earlier transaction saw, so `If-Match` would be
+        guarding nothing at all.
+        """
+        project = self.session.scalar(
+            select(Project)
+            .where(Project.tenant_id == self.tenant_id, Project.id == project_id)
+            .with_for_update()
+        )
+        if project is None:
+            raise ApiError(ErrorCode.NOT_FOUND, "Project not found in your tenant")
         if expected_row_version is not None and project.row_version != expected_row_version:
             raise ApiError(
                 ErrorCode.VERSION_CONFLICT,
@@ -390,6 +418,41 @@ class AccessRepository(Scoped[Project]):
         project.row_version = int(project.row_version or 1) + 1
         self.session.flush()
         return project
+
+    def patch_mcp_policy(
+        self,
+        project_id: str,
+        *,
+        patch: dict[str, bool],
+        expected_row_version: int | None,
+    ) -> tuple[Project, McpPolicy, McpPolicy]:
+        """The other settings write entrance: a partial MCP policy update, on the same row lock (§5.5).
+
+        Both writers re-read the row here and compare `If-Match` inside the lock, because a detached
+        project read earlier is a snapshot of what some other transaction saw, and comparing against it
+        would let a stale policy write succeed. Returns the project and the policy before and after, so
+        the caller can audit the pair in this same transaction.
+        """
+        project = self.session.scalar(
+            select(Project)
+            .where(Project.tenant_id == self.tenant_id, Project.id == project_id)
+            .with_for_update()
+        )
+        if project is None:
+            raise ApiError(ErrorCode.NOT_FOUND, "Project not found in your tenant")
+        if expected_row_version is not None and project.row_version != expected_row_version:
+            raise ApiError(
+                ErrorCode.VERSION_CONFLICT,
+                "The project changed since you loaded it; reload before saving.",
+                details={"current_row_version": project.row_version},
+            )
+        view = read_policy(project.settings)
+        require_complete_repair(view, patch)
+        after = merge_policy(view.policy, patch)
+        project.settings = apply_policy_to_settings(project.settings, after)
+        project.row_version = int(project.row_version or 1) + 1
+        self.session.flush()
+        return project, view.policy, after
 
     def user_by_subject(self, issuer: str, subject: str) -> AppUser | None:
         return self.session.scalar(

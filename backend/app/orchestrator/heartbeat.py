@@ -13,6 +13,7 @@ from typing import Any
 
 from ..config import Settings, get_settings
 from ..db.base import get_database
+from ..db.models import QUEUES_KEY
 from ..observability import get_logger
 from ..repositories.executions import ExecutionRepository
 
@@ -124,13 +125,19 @@ class WorkerAnnouncer:
         pool_name: str | None = None,
         active_count: Any = None,
         capabilities: dict[str, Any] | None = None,
+        roles: list[str] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.worker_id = worker_id
         self.capacity = int(capacity if capacity is not None else self.settings.worker_slots)
         self.pool_name = pool_name or self.settings.worker_pool_name
         self._active_count = active_count
-        self.capabilities = capabilities or {"browsers": self.settings.browser_channel_list, "actions": "ir-1.0"}
+        declared = dict(capabilities or {"browsers": self.settings.browser_channel_list, "actions": "ir-1.0"})
+        # Which queues this process serves. Absent means no queue capacity is claimed: the readiness
+        # probe may not guess that an unlabelled worker covers a queue it was never started for (§13.5).
+        if roles:
+            declared[QUEUES_KEY] = [str(item) for item in roles]
+        self.capabilities = declared
         self.db = get_database()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -138,6 +145,10 @@ class WorkerAnnouncer:
         self.draining = False
 
     def start(self) -> WorkerAnnouncer:
+        # The first beat is synchronous (§9.3): a process that has started is alive now, and a fleet that
+        # only becomes visible one interval later makes `live_workers` - which is what `worker_available`
+        # and the readiness probe read - answer "no worker is alive" about a worker that is standing here.
+        self._beat()
         self._thread = threading.Thread(target=self._loop, name=f"announce-{self.worker_id[:12]}", daemon=True)
         self._thread.start()
         return self
@@ -163,12 +174,16 @@ class WorkerAnnouncer:
     def _loop(self) -> None:
         interval = float(self.settings.lease_heartbeat_seconds)
         while not self._stop.wait(interval):
-            try:
-                self._tick()
-            except Exception as exc:
-                log.warning(
-                    "worker announce failed", extra={"context": {"worker_id": self.worker_id, "error": str(exc)}}
-                )
+            self._beat()
+
+    def _beat(self) -> None:
+        """One announcement, and a started process must not die of a database that blinked."""
+        try:
+            self._tick()
+        except Exception as exc:
+            log.warning(
+                "worker announce failed", extra={"context": {"worker_id": self.worker_id, "error": str(exc)}}
+            )
 
     def _tick(self) -> None:
         from ..repositories.reservations import PoolRepository, WorkerLeaseRepository

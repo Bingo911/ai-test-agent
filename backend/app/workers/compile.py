@@ -20,8 +20,18 @@ from ..observability import get_logger
 from ..repositories.cases import CaseRepository, CompileRepository, compile_dedupe_key
 from ..repositories.platform import AccessRepository
 from ..repositories.resources import AttachmentRepository
+from ..services.ai_intent import MCP_ORIGIN, intersection, server_ai_allowed
 
 log = get_logger(__name__)
+
+
+def _stopped_diagnostic(reason: str) -> dict[str, Any]:
+    """A WARNING, never an ERROR: the compile succeeded, and an ERROR would become the artifact's error code."""
+    return {
+        "code": reason,
+        "severity": "WARNING",
+        "message": "The project no longer allows server-side AI, so this compile ran deterministically",
+    }
 
 
 class CompileWorker:
@@ -36,6 +46,7 @@ class CompileWorker:
         revision_id = str(payload["revision_id"])
         force = bool(payload.get("force"))
         use_ai = bool(payload.get("use_ai", False))
+        origin = str(payload.get("origin") or "")
 
         markdown, _source_digest, artifact_id, already_done = self._prepare(
             tenant_id, project_id, revision_id, force, use_ai
@@ -45,7 +56,8 @@ class CompileWorker:
 
         capabilities = set(self.executor.capabilities().actions)
         attachments, allow_vision = self._project_inputs(tenant_id, project_id, revision_id)
-        adapter = AiAdapter(self.settings, purpose="compiler") if use_ai else None
+        asked, stopped = self._ai_intent(tenant_id, project_id, origin=origin, asked=use_ai)
+        adapter = AiAdapter(self.settings, purpose="compiler") if asked else None
 
         try:
             outcome = compile_revision(
@@ -79,15 +91,20 @@ class CompileWorker:
                 compiler_mode="deterministic",
                 error_code=ErrorCode.COMPILER_CAPABILITY_MISSING.value,
             )
+        diagnostics = list(outcome.diagnostics)
+        usage = dict(outcome.usage or {})
+        if stopped:
+            diagnostics.append(_stopped_diagnostic(stopped))
+            usage["ai_stopped"] = stopped
         return self._record(
             tenant_id,
             artifact_id,
             status=outcome.status,
             ir=outcome.ir,
             ir_digest=outcome.ir_digest,
-            diagnostics=outcome.diagnostics,
+            diagnostics=diagnostics,
             review_items=outcome.review_items,
-            usage=outcome.usage,
+            usage=usage,
             model=outcome.model,
             prompt_version=outcome.prompt_version,
             compiler_mode=outcome.compiler_mode,
@@ -137,6 +154,17 @@ class CompileWorker:
                 )
             session.commit()
             return revision.markdown, revision.source_digest, artifact.id, None
+
+    def _ai_intent(self, tenant_id: str, project_id: str, *, origin: str, asked: bool) -> tuple[bool, str | None]:
+        """The policy at the moment of the model call, not the one that was true when the job was queued.
+
+        A console job keeps the intent it arrived with. A job MCP queued is only honoured while the project
+        still agrees, because this is where the case text leaves the platform (§6.4).
+        """
+        if origin != MCP_ORIGIN or not asked:
+            return asked, None
+        with self.db.session(tenant_id) as session:
+            return intersection(origin, asked, server_ai_allowed(session, tenant_id, project_id))
 
     def _project_inputs(self, tenant_id: str, project_id: str, revision_id: str) -> tuple[dict[str, str], bool]:
         with self.db.session(tenant_id) as session:

@@ -26,6 +26,7 @@ from ..domain.errors import ErrorCode
 from ..observability import get_logger
 from ..repositories.artifacts import ArtifactRepository, FailureAnalysisRepository
 from ..repositories.executions import ExecutionRepository
+from ..services.ai_intent import AI_STOPPED_EVENT, intersection, server_ai_allowed
 from ..services.object_store import get_object_store
 
 log = get_logger(__name__)
@@ -65,13 +66,28 @@ class AnalysisWorker:
 
         rules = classify(facts["error_code"], message=facts.get("message"), step=facts["failing_step"])
         row_id, _project_id = self._start(tenant_id, facts)
-        self._write(tenant_id, row_id, status=AnalysisStatus.SUCCEEDED.value, source="rules", error_code=None, **rules)
-
-        if (
+        unreachable = (
             not self.settings.ai_enabled
             or not facts["failing_step"]
             or facts["evidence_mode"] == Sensitivity.SENSITIVE.value
-        ):
+        )
+        # The intersection is only read when the provider was otherwise reachable. A run that could not
+        # have called the model for its own reasons has no policy to have been stopped by, and a stop
+        # reason recorded there would claim a cause that never operated (§6.4).
+        asked, stopped = (True, None) if unreachable else self._model_intent(facts)
+        self._write(
+            tenant_id,
+            row_id,
+            status=AnalysisStatus.SUCCEEDED.value,
+            source="rules",
+            error_code=None,
+            usage={"ai_stopped": stopped} if stopped else None,
+            **rules,
+        )
+
+        if unreachable or not asked:
+            if stopped:
+                self._stopped(tenant_id, execution_id, stopped)
             self._set_status(
                 tenant_id,
                 execution_id,
@@ -153,6 +169,8 @@ class AnalysisWorker:
                 "evidence_mode": execution.evidence_mode,
                 "artifact_status": execution.artifact_status,
                 "browser_version": execution.browser_version,
+                # What the caller asked the server's AI to do, frozen when the run was queued (§6.4).
+                "run_ai": (execution.snapshot or {}).get("run_ai"),
                 # Anything the model may cite has to be evidence of *this* execution (§12.3).
                 "artifact_refs": [
                     f"artifact:{row.id}"
@@ -183,6 +201,25 @@ class AnalysisWorker:
             # The analysis worker is not the lease holder and it writes to a finished run, so the
             # lease-countersigned path is the wrong guard here (§12.3).
             ExecutionRepository(session, tenant_id).set_analysis_status(execution_id, status=status)
+
+    def _model_intent(self, facts: dict[str, Any]) -> tuple[bool, str | None]:
+        """The intent the run carried and the policy as it stands now, intersected (§6.4).
+
+        A run with no recorded intent came from the console: the project's MCP policy does not govern
+        REST's AI behaviour, so an absent key means this is not this worker's decision to make (§12,
+        AC-40).
+        """
+        run_ai = facts.get("run_ai")
+        if not isinstance(run_ai, dict):
+            return True, None
+        with self.db.session(facts["tenant_id"]) as session:
+            allowed_now = server_ai_allowed(session, facts["tenant_id"], facts["project_id"])
+        return intersection(run_ai.get("origin"), bool(run_ai.get("use_server_ai")), allowed_now)
+
+    def _stopped(self, tenant_id: str, execution_id: str, reason: str) -> None:
+        from ..orchestrator.events import append_event
+
+        append_event(tenant_id, execution_id, AI_STOPPED_EVENT, {"purpose": "analysis", "reason": reason})
 
     def _emit(self, tenant_id: str, execution_id: str, accepted: dict[str, Any]) -> None:
         from ..orchestrator.events import append_event

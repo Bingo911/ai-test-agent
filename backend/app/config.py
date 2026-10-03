@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,9 +19,35 @@ DEFAULT_DEV_TOKENS = frozenset({"dev-admin-token", "dev-engineer-token"})
 
 AppEnv = Literal["development", "test", "production"]
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _host_of(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
+
+
+def _url_problems(field_name: str, value: str, *, require_path: str | None) -> list[str]:
+    """A resource URL feeds an OAuth `resource` claim, so a malformed one is a broken authorisation contract."""
+    parsed = urlparse(value)
+    problems: list[str] = []
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        problems.append(f"{field_name} must be an absolute http(s) URL")
+        return problems
+    if parsed.query or parsed.fragment:
+        problems.append(f"{field_name} must not carry a query or fragment")
+    if require_path is not None and parsed.path.rstrip("/") != require_path:
+        problems.append(f"{field_name} must end in {require_path}")
+    return problems
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _csv_list(value: str) -> list[str]:
+    """Split a comma-separated setting, dropping blanks; a wildcard here would mean "any caller"."""
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return [item for item in items if item != "*"]
 
 
 class Settings(BaseSettings):
@@ -35,6 +63,11 @@ class Settings(BaseSettings):
     #: Loopback by default: a container or a reverse proxy sets API_HOST=0.0.0.0 deliberately.
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    #: §13.3: `X-Forwarded-*` is believed only from the addresses named below, and only once an operator
+    #: opts in. A process that reads a forwarding header from anyone is one where a client picks its own
+    #: apparent address, so the default is to read none of them.
+    proxy_headers: bool = False
+    forwarded_allow_ips: str = "127.0.0.1"
     web_origin: str = "http://localhost:5173"
     log_level: str = "INFO"
     data_dir: Path = Field(default_factory=lambda: _project_root() / "data")
@@ -67,6 +100,10 @@ class Settings(BaseSettings):
     # --- execution budgets (§9.5) ---
     worker_slots: int = 4
     worker_pool_name: str = "default"
+    #: The queue names one worker process serves, e.g. `execution` or `compile,analysis`. The readiness
+    #: probe reports per-queue capacity (§13.5), and a heartbeat that does not say which queues it covers
+    #: is not evidence about any of them, so an unset value means "no capacity claimed", never "assume me".
+    worker_roles: str = ""
     queue_timeout_seconds: int = 600
     step_timeout_ms: int = 10_000
     navigation_timeout_ms: int = 30_000
@@ -155,6 +192,33 @@ class Settings(BaseSettings):
     egress_allow_private: bool = True
     egress_allow_http: bool = True
 
+    # --- MCP adapter (MCP design §12.1) ---
+    #: Off by default: no MCP routes, manager, threads or connections exist until an operator opts in.
+    mcp_enabled: bool = False
+    mcp_public_url: str = "http://127.0.0.1:8000/mcp"
+    mcp_console_url: str = "http://localhost:5173"
+    mcp_allowed_hosts: str = "127.0.0.1:8000,localhost:8000"
+    mcp_allowed_origins: str = "http://localhost:5173"
+    mcp_oidc_audience: str | None = None
+    mcp_max_request_bytes: int = 1_048_576
+    mcp_max_response_bytes: int = 4_194_304
+    mcp_max_metadata_response_bytes: int = 262_144
+    mcp_tool_timeout_seconds: float = 15.0
+    mcp_auth_max_inflight: int = 2
+    mcp_auth_timeout_seconds: float = 2.0
+    mcp_jwks_timeout_seconds: float = 1.0
+    mcp_rate_limit_per_minute: int = 60
+    mcp_rate_limit_burst: int = 10
+    mcp_max_inflight_per_user: int = 4
+    mcp_max_inflight_total: int = 2
+    mcp_max_admission_inflight: int = 8
+    mcp_max_admission_per_user: int = 2
+    mcp_redis_admission_timeout_seconds: float = 1.5
+    mcp_redis_cleanup_timeout_seconds: float = 0.5
+    mcp_db_pool_size: int = 2
+    #: Falls back to the broker URL; a deployment may separate them so one outage does not cause the other.
+    mcp_limiter_redis_url: str | None = None
+
     @field_validator("data_dir", "ai_cache_dir", mode="after")
     @classmethod
     def _absolute(cls, value: Path | None) -> Path | None:
@@ -167,6 +231,31 @@ class Settings(BaseSettings):
     @property
     def browser_channel_list(self) -> list[str]:
         return [item.strip() for item in self.browser_channels.split(",") if item.strip()]
+
+    @property
+    def worker_role_list(self) -> list[str]:
+        return [item.strip() for item in self.worker_roles.split(",") if item.strip()]
+
+    @property
+    def mcp_allowed_host_list(self) -> list[str]:
+        return _csv_list(self.mcp_allowed_hosts)
+
+    @property
+    def forwarded_allow_ip_list(self) -> list[str]:
+        return _csv_list(self.forwarded_allow_ips)
+
+    @property
+    def resolved_forwarded_allow_ips(self) -> str:
+        """The trust list as the server receives it: concrete addresses, with any wildcard already removed."""
+        return ",".join(self.forwarded_allow_ip_list)
+
+    @property
+    def mcp_allowed_origin_list(self) -> list[str]:
+        return _csv_list(self.mcp_allowed_origins)
+
+    @property
+    def resolved_mcp_limiter_url(self) -> str:
+        return self.mcp_limiter_redis_url or self.redis_url
 
     @property
     def artifact_dir(self) -> Path:
@@ -189,6 +278,10 @@ class Settings(BaseSettings):
             problems.append("step_timeout_ms must not exceed step_timeout_max_ms")
         if self.queue_backend == "celery" and not self.redis_url:
             problems.append("redis_url is required when queue_backend=celery")
+        # A wildcard here would be "believe any peer", which is the opposite of the proxy contract; the
+        # cleaned list drops it, so opting in with only a wildcard left is opting in to nothing (§13.3).
+        if self.proxy_headers and not self.forwarded_allow_ip_list:
+            problems.append("proxy_headers requires forwarded_allow_ips to name the proxy's own address")
         if self.ai_enabled and not self.ai_base_url:
             problems.append("ai_base_url is required when ai_enabled")
         if self.secret_provider != "local_fernet":  # noqa: S105 (provider name, not a credential)
@@ -197,8 +290,108 @@ class Settings(BaseSettings):
             )
         if not self.is_development:
             problems.extend(self._production_problems())
+        if self.mcp_enabled:
+            problems.extend(self._mcp_problems())
         if problems:
             raise ValueError("; ".join(problems))
+
+    def _mcp_problems(self) -> list[str]:
+        """Every MCP budget is enforced at startup, because a wrong one is only observable under load (§12.2)."""
+        problems: list[str] = []
+        counts = {
+            "mcp_max_request_bytes": self.mcp_max_request_bytes,
+            "mcp_max_response_bytes": self.mcp_max_response_bytes,
+            "mcp_max_metadata_response_bytes": self.mcp_max_metadata_response_bytes,
+            "mcp_auth_max_inflight": self.mcp_auth_max_inflight,
+            "mcp_rate_limit_per_minute": self.mcp_rate_limit_per_minute,
+            "mcp_rate_limit_burst": self.mcp_rate_limit_burst,
+            "mcp_max_inflight_per_user": self.mcp_max_inflight_per_user,
+            "mcp_max_inflight_total": self.mcp_max_inflight_total,
+            "mcp_max_admission_inflight": self.mcp_max_admission_inflight,
+            "mcp_max_admission_per_user": self.mcp_max_admission_per_user,
+            "mcp_db_pool_size": self.mcp_db_pool_size,
+        }
+        for name, value in counts.items():
+            if value < 1:
+                problems.append(f"{name} must be a positive integer when MCP is enabled")
+        durations = {
+            "mcp_tool_timeout_seconds": self.mcp_tool_timeout_seconds,
+            "mcp_auth_timeout_seconds": self.mcp_auth_timeout_seconds,
+            "mcp_jwks_timeout_seconds": self.mcp_jwks_timeout_seconds,
+            "mcp_redis_admission_timeout_seconds": self.mcp_redis_admission_timeout_seconds,
+            "mcp_redis_cleanup_timeout_seconds": self.mcp_redis_cleanup_timeout_seconds,
+        }
+        for name, value in durations.items():
+            if not math.isfinite(value) or value <= 0:
+                problems.append(f"{name} must be a finite positive number when MCP is enabled")
+
+        # A bounded MCP body must stay inside the platform's own body ceiling, or the smaller limit wins silently.
+        if self.mcp_max_request_bytes > self.max_request_body_bytes:
+            problems.append("mcp_max_request_bytes must not exceed max_request_body_bytes")
+        # Two layers of JSON escaping turn one source byte into up to fourteen; 128 KiB is left for the
+        # rest of the envelope, so a full-text read cannot be refused by a budget that was never sized for it.
+        needed = 14 * self.max_case_bytes + 131_072
+        if self.mcp_max_response_bytes < needed:
+            problems.append(f"mcp_max_response_bytes must be at least {needed} bytes")
+        if self.mcp_max_metadata_response_bytes > self.mcp_max_response_bytes:
+            problems.append("mcp_max_metadata_response_bytes must not exceed mcp_max_response_bytes")
+
+        # Thread and connection ceilings: an admission slot that cannot get a connection would block a
+        # worker thread holding a database handle, which is the exhaustion this whole layer exists to prevent.
+        if self.mcp_max_inflight_total > self.mcp_db_pool_size:
+            problems.append("mcp_max_inflight_total must not exceed mcp_db_pool_size")
+        if self.mcp_max_inflight_total > self.mcp_max_admission_inflight:
+            problems.append("mcp_max_inflight_total must not exceed mcp_max_admission_inflight")
+        if self.mcp_auth_max_inflight > self.mcp_max_admission_inflight:
+            problems.append("mcp_auth_max_inflight must not exceed mcp_max_admission_inflight")
+        if self.mcp_max_admission_per_user > self.mcp_max_admission_inflight:
+            problems.append("mcp_max_admission_per_user must not exceed mcp_max_admission_inflight")
+
+        # Nested budgets: an inner phase may not outlast the phase that is waiting for it.
+        if self.mcp_jwks_timeout_seconds > self.mcp_auth_timeout_seconds:
+            problems.append("mcp_jwks_timeout_seconds must not exceed mcp_auth_timeout_seconds")
+        if self.mcp_auth_timeout_seconds > self.mcp_tool_timeout_seconds:
+            problems.append("mcp_auth_timeout_seconds must not exceed mcp_tool_timeout_seconds")
+        if self.mcp_redis_admission_timeout_seconds > self.mcp_tool_timeout_seconds:
+            problems.append("mcp_redis_admission_timeout_seconds must not exceed mcp_tool_timeout_seconds")
+
+        # mcp_max_inflight_per_user is a cross-replica ceiling counted in Redis, so it is deliberately
+        # allowed above the per-process total; burst is a rate balance, not concurrent capacity.
+        if self.mcp_max_inflight_per_user < 1:
+            problems.append("mcp_max_inflight_per_user must be at least 1")
+
+        problems.extend(_url_problems("mcp_public_url", self.mcp_public_url, require_path="/mcp"))
+        problems.extend(_url_problems("mcp_console_url", self.mcp_console_url, require_path=None))
+        # The transport refuses a Host it does not know, so an allowlist that never mentions the address the
+        # clients are actually pointed at is a deployment that rejects its own traffic (§13.3). A port form is
+        # part of the entry, not part of the check: one host may be reached with and without a port.
+        allowed_hostnames = {urlparse(f"//{entry}").hostname or entry.lower() for entry in self.mcp_allowed_host_list}
+        if not self.mcp_allowed_host_list:
+            problems.append("mcp_allowed_hosts must list the real hosts, not a wildcard")
+        elif _host_of(self.mcp_public_url) not in allowed_hostnames:
+            problems.append("mcp_allowed_hosts must name the host of mcp_public_url")
+        if not self.mcp_allowed_origin_list:
+            problems.append("mcp_allowed_origins must list concrete origins, not a wildcard")
+        # Two engines over `sqlite:///:memory:` are two different empty databases, not one shared state.
+        if self.database_url.startswith("sqlite") and (
+            ":memory:" in self.database_url or self.database_url.rstrip("/").endswith("sqlite:")
+        ):
+            problems.append("MCP requires a file-backed sqlite database, not :memory:")
+        if not self.is_development:
+            if self.mcp_public_url.lower().startswith("http://"):
+                problems.append("mcp_public_url must be HTTPS outside development")
+            if self.mcp_console_url.lower().startswith("http://"):
+                problems.append("mcp_console_url must be HTTPS outside development")
+            if not self.mcp_oidc_audience:
+                problems.append("mcp_oidc_audience is required when MCP is enabled outside development")
+            if not self.mcp_limiter_redis_url:
+                problems.append("mcp_limiter_redis_url is required when MCP is enabled outside development")
+            if self.queue_backend != "celery":
+                problems.append("queue_backend must be celery when MCP is enabled outside development")
+        elif self.auth_mode == "dev" and _host_of(self.mcp_public_url) not in _LOOPBACK_HOSTS:
+            # A dev token in the header is only ever as private as the address that will accept it.
+            problems.append("auth_mode=dev only permits MCP on a loopback public url")
+        return problems
 
     def _production_problems(self) -> list[str]:
         """A production process must not start with the development credential path open (§14.1)."""

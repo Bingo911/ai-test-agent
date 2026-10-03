@@ -24,6 +24,8 @@ dependencies = [
     "PyJWT[crypto]>=2.10,<3.0",
     # FastAPI raises while importing the upload routes without this; it is not a transitive dependency.
     "python-multipart>=0.0.20,<0.2",
+    "mcp>=2,<3",
+    "redis>=5.2,<7.0",
 ]
 
 [project.optional-dependencies]

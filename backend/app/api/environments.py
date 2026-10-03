@@ -44,8 +44,9 @@ class SecretWrite(BaseModel):
 def list_environments(ctx: Ctx, project_id: str) -> dict[str, Any]:
     """Reading is open to project members: a run has to show which network it will use (§13.5)."""
     ctx.project(project_id)
+    service = EnvironmentService(ctx.settings, database=ctx.database)
     return {
-        "items": EnvironmentService(ctx.settings).list(tenant_id=ctx.tenant_id, project_id=project_id),
+        "items": service.list(tenant_id=ctx.tenant_id, project_id=project_id),
         "next_cursor": None,
     }
 
@@ -53,7 +54,7 @@ def list_environments(ctx: Ctx, project_id: str) -> dict[str, Any]:
 @router.post("/projects/{project_id}/environments", status_code=201)
 def create_environment(ctx: Ctx, project_id: str, body: EnvironmentCreate) -> dict[str, Any]:
     ctx.project(project_id, permission=Permission.ENV_MANAGE)
-    result = EnvironmentService(ctx.settings).create(
+    result = EnvironmentService(ctx.settings, database=ctx.database).create(
         tenant_id=ctx.tenant_id, project_id=project_id, name=body.name, created_by=ctx.actor_id
     )
     with ctx.session() as session:
@@ -71,7 +72,8 @@ def create_environment(ctx: Ctx, project_id: str, body: EnvironmentCreate) -> di
 @router.get("/projects/{project_id}/environments/{name}")
 def get_environment(ctx: Ctx, project_id: str, name: str, response: Response) -> dict[str, Any]:
     ctx.project(project_id)
-    payload = EnvironmentService(ctx.settings).by_name(tenant_id=ctx.tenant_id, project_id=project_id, name=name)
+    service = EnvironmentService(ctx.settings, database=ctx.database)
+    payload = service.by_name(tenant_id=ctx.tenant_id, project_id=project_id, name=name)
     response.headers["ETag"] = etag("environment", payload["environment_id"], int(payload["row_version"]))
     return payload
 
@@ -91,7 +93,7 @@ def publish_revision(
             raise ApiError(ErrorCode.NOT_FOUND, "Environment not found in this tenant")
     ctx.project(environment.project_id, permission=Permission.ENV_MANAGE)
     expected = parse_if_match(if_match, required=True)
-    result = EnvironmentService(ctx.settings).publish(
+    result = EnvironmentService(ctx.settings, database=ctx.database).publish(
         tenant_id=ctx.tenant_id,
         environment_id=environment_id,
         config=body.config,
@@ -126,7 +128,8 @@ def list_revisions(ctx: Ctx, environment_id: str, page: Annotated[Page, Depends(
         if environment is None:
             raise ApiError(ErrorCode.NOT_FOUND, "Environment not found in this tenant")
     ctx.project(environment.project_id)
-    items = EnvironmentService(ctx.settings).revisions(tenant_id=ctx.tenant_id, environment_id=environment_id)
+    service = EnvironmentService(ctx.settings, database=ctx.database)
+    items = service.revisions(tenant_id=ctx.tenant_id, environment_id=environment_id)
     return page_envelope(items, page)
 
 
@@ -137,7 +140,8 @@ def archive_environment(ctx: Ctx, environment_id: str) -> dict[str, Any]:
         if environment is None:
             raise ApiError(ErrorCode.NOT_FOUND, "Environment not found in this tenant")
     ctx.project(environment.project_id, permission=Permission.ENV_MANAGE)
-    result = EnvironmentService(ctx.settings).archive(tenant_id=ctx.tenant_id, environment_id=environment_id)
+    service = EnvironmentService(ctx.settings, database=ctx.database)
+    result = service.archive(tenant_id=ctx.tenant_id, environment_id=environment_id)
     with ctx.session() as session:
         ctx.audit(
             session,
@@ -156,14 +160,15 @@ def archive_environment(ctx: Ctx, environment_id: str) -> dict[str, Any]:
 def list_secrets(ctx: Ctx, project_id: str) -> dict[str, Any]:
     """Metadata only — names, versions, providers. A stored value is never readable back (§14.3)."""
     ctx.project(project_id, permission=Permission.SECRET_MANAGE)
-    items = EnvironmentService(ctx.settings).secret_versions(tenant_id=ctx.tenant_id, project_id=project_id)
+    service = EnvironmentService(ctx.settings, database=ctx.database)
+    items = service.secret_versions(tenant_id=ctx.tenant_id, project_id=project_id)
     return {"items": items, "next_cursor": None}
 
 
 @router.post("/projects/{project_id}/secrets", status_code=201)
 def put_secret(ctx: Ctx, project_id: str, body: SecretWrite) -> dict[str, Any]:
     ctx.project(project_id, permission=Permission.SECRET_MANAGE)
-    result = EnvironmentService(ctx.settings).put_secret(
+    result = EnvironmentService(ctx.settings, database=ctx.database).put_secret(
         tenant_id=ctx.tenant_id,
         project_id=project_id,
         logical_name=body.logical_name,
@@ -187,7 +192,7 @@ def put_secret(ctx: Ctx, project_id: str, body: SecretWrite) -> dict[str, Any]:
 def revoke_secret(ctx: Ctx, project_id: str, logical_name: str, version: int) -> dict[str, Any]:
     """Revocation is explicit: an execution bound to it then fails loudly instead of silently rotating."""
     ctx.project(project_id, permission=Permission.SECRET_MANAGE)
-    result = EnvironmentService(ctx.settings).revoke_secret(
+    result = EnvironmentService(ctx.settings, database=ctx.database).revoke_secret(
         tenant_id=ctx.tenant_id, project_id=project_id, logical_name=logical_name, version=version
     )
     with ctx.session() as session:

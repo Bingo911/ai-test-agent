@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import Select, and_, func, or_, select
 
 from ..db.base import new_id, utcnow
 from ..db.models import CaseRevision, CaseTag, CompileArtifact, Tag, TestCase
@@ -28,6 +28,31 @@ def compile_dedupe_key(
     earlier AI-assisted compile produced, and a save must not reuse the row an explicit recompile made.
     """
     return f"{tenant_id}:{revision_id}:{revision_digest}:{compiler_version}:{'ai' if use_ai else 'det'}"
+
+
+def latest_attempt(statement: Select) -> Select:
+    """Pin a compile-artifact statement to "the newest attempt", with the tiebreaker that makes it one row.
+
+    `created_at DESC, id DESC` is the platform's only reading of *latest* (§6.3): attempts can share a
+    timestamp, and a bare `created_at DESC` then leaves `LIMIT 1` free to answer differently on two runs of
+    the same query. The `id` breaks the tie so the answer is stable, without claiming an id orders attempts
+    in time. Every reader of "the newest attempt" goes through here - the repository and the MCP case page
+    alike - so a client that was handed an artifact id is never told it is something else.
+    """
+    return statement.order_by(CompileArtifact.created_at.desc(), CompileArtifact.id.desc()).limit(1)
+
+
+def is_executable(artifact: CompileArtifact) -> bool:
+    """§3.2's "may a run use this", read off the row the caller is already holding.
+
+    `CompileRepository.executable_for_revision` states the same rule in SQL, and the two are tested against
+    each other. This form is still needed because a run may pin an *older* attempt by id (§6.4), and the SQL
+    form - which searches for the newest executable one - would answer false for a confirmed artifact that
+    a newer failed attempt happens to sit on top of.
+    """
+    if artifact.status == CompileStatus.SUCCEEDED.value:
+        return True
+    return artifact.status == CompileStatus.NEEDS_REVIEW.value and artifact.confirmed_at is not None
 
 
 class CaseRepository(Scoped[TestCase]):
@@ -139,13 +164,27 @@ class CaseRepository(Scoped[TestCase]):
             conditions.append(TestCase.archived_at.is_(None))
         if search:
             conditions.append(TestCase.name.ilike(f"%{search}%"))  # type: ignore[attr-defined]
-        total = self.session.scalar(select(func.count()).select_from(TestCase).where(*conditions)) or 0
-        stmt = select(TestCase).where(*conditions).order_by(TestCase.updated_at.desc()).limit(limit).offset(offset)
+        wanted = select(TestCase.id).where(*conditions)
         if tag_ids:
-            stmt = stmt.join(
-                CaseTag,
-                (CaseTag.case_id == TestCase.id) & (CaseTag.tenant_id == TestCase.tenant_id),  # type: ignore[arg-type]
-            ).where(CaseTag.tag_id.in_(list(tag_ids)))
+            # `in_` rather than a join in the page statement: a case carrying two of the requested tags
+            # is still one row. `distinct` here is what lets the same statement answer for the count, so
+            # `total` cannot disagree with what the page lists.
+            wanted = (
+                wanted.join(
+                    CaseTag,
+                    (CaseTag.case_id == TestCase.id) & (CaseTag.tenant_id == TestCase.tenant_id),  # type: ignore[arg-type]
+                )
+                .where(CaseTag.tag_id.in_(list(tag_ids)))
+                .distinct()
+            )
+        total = self.session.scalar(select(func.count()).select_from(wanted.subquery())) or 0
+        stmt = (
+            select(TestCase)
+            .where(TestCase.id.in_(wanted))
+            .order_by(TestCase.updated_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
         return list(self.session.scalars(stmt).all()), int(total)
 
     def revision(self, revision_id: str) -> CaseRevision | None:
@@ -284,27 +323,27 @@ class CompileRepository(Scoped[CompileArtifact]):
 
     def latest(self, revision_id: str) -> CompileArtifact | None:
         return self.session.scalar(
-            select(CompileArtifact)
-            .where(CompileArtifact.tenant_id == self.tenant_id, CompileArtifact.revision_id == revision_id)
-            .order_by(CompileArtifact.created_at.desc())
-            .limit(1)
+            latest_attempt(
+                select(CompileArtifact).where(
+                    CompileArtifact.tenant_id == self.tenant_id, CompileArtifact.revision_id == revision_id
+                )
+            )
         )
 
     def executable_for_revision(self, revision_id: str) -> CompileArtifact | None:
         """A run may only use a clean compile, or a review one a human has confirmed (§3.2, §6.2)."""
         return self.session.scalar(
-            select(CompileArtifact)
-            .where(
-                CompileArtifact.tenant_id == self.tenant_id,
-                CompileArtifact.revision_id == revision_id,
-                or_(
-                    CompileArtifact.status == CompileStatus.SUCCEEDED.value,
-                    and_(
-                        CompileArtifact.status == CompileStatus.NEEDS_REVIEW.value,
-                        CompileArtifact.confirmed_at.isnot(None),
+            latest_attempt(
+                select(CompileArtifact).where(
+                    CompileArtifact.tenant_id == self.tenant_id,
+                    CompileArtifact.revision_id == revision_id,
+                    or_(
+                        CompileArtifact.status == CompileStatus.SUCCEEDED.value,
+                        and_(
+                            CompileArtifact.status == CompileStatus.NEEDS_REVIEW.value,
+                            CompileArtifact.confirmed_at.isnot(None),
+                        ),
                     ),
-                ),
+                )
             )
-            .order_by(CompileArtifact.created_at.desc())
-            .limit(1)
         )

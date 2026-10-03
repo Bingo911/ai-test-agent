@@ -19,6 +19,11 @@ class ErrorCode(str, Enum):
     DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"
     VERSION_CONFLICT = "VERSION_CONFLICT"
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+    #: A serialised command lost its lock wait rather than its correctness; the key stays usable (§9.3.6).
+    COMMAND_BUSY = "COMMAND_BUSY"
+    #: A pre-upgrade record proves nothing about whether the write happened, so it is neither replayed
+    #: nor taken over (§9.3).
+    IDEMPOTENCY_RESULT_UNKNOWN = "IDEMPOTENCY_RESULT_UNKNOWN"
     EVENT_CURSOR_EXPIRED = "EVENT_CURSOR_EXPIRED"
 
     # DSL / compiler (§4.3)
@@ -121,6 +126,7 @@ STATUS_FOR_CODE: dict[ErrorCode, int] = {
     ErrorCode.CONFLICT: 409,
     ErrorCode.VERSION_CONFLICT: 409,
     ErrorCode.IDEMPOTENCY_CONFLICT: 409,
+    ErrorCode.IDEMPOTENCY_RESULT_UNKNOWN: 409,
     ErrorCode.COMPILE_REVIEW_REQUIRED: 409,
     ErrorCode.COMPILE_STALE_DIGEST: 409,
     ErrorCode.COMPILE_FAILED: 409,
@@ -143,6 +149,8 @@ STATUS_FOR_CODE: dict[ErrorCode, int] = {
     ErrorCode.QUOTA_EXCEEDED: 429,
     ErrorCode.AI_BUDGET_EXCEEDED: 429,
     ErrorCode.DEPENDENCY_UNAVAILABLE: 503,
+    #: Lock and admission waits are transient by definition, and the client keeps its key (§9.3.6).
+    ErrorCode.COMMAND_BUSY: 503,
     ErrorCode.AI_UNAVAILABLE: 503,
     ErrorCode.SECRET_UNAVAILABLE: 503,
     ErrorCode.STATE_STORE_UNAVAILABLE: 503,

@@ -13,6 +13,7 @@ from ..db.base import new_id, utcnow
 from ..db.models import Project, TenantMembership
 from ..domain.enums import Permission, Role
 from ..domain.errors import ApiError, ErrorCode
+from ..domain.mcp_policy import McpPolicyPatch, read_policy, validate_settings_for_write
 from ..repositories.platform import AccessRepository, UserRepository
 from .deps import Ctx, Page, etag, idempotent, page_envelope, page_params, parse_if_match
 from .tickets import get_ticket_store
@@ -154,9 +155,17 @@ def patch_project(
 ) -> dict[str, Any]:
     project = ctx.project(project_id, permission=Permission.PROJECT_MANAGE)
     expected = parse_if_match(if_match, required=True)
+    policy_change: dict[str, Any] | None = None
+    if body.settings is not None:
+        # A whole-settings replacement keeps its replace-everything contract, but the policy sub-object
+        # is validated here too, and omitting it means the default-closed policy rather than "keep what
+        # was there" - which is a change an audit line has to name (§5.5, AC-33).
+        policy_after = validate_settings_for_write(body.settings)
+        policy_before = read_policy(project.settings).effective
+        policy_change = {"before": policy_before, "after": policy_after, "changed": policy_before != policy_after}
     with ctx.session() as session:
         updated = AccessRepository(session, ctx.tenant_id).update_project(
-            project,
+            project.id,
             display_name=body.display_name,
             description=body.description,
             quota=body.quota,
@@ -164,19 +173,63 @@ def patch_project(
             archived=body.archived,
             expected_row_version=expected,
         )
+        detail: dict[str, Any] = {
+            "archived": updated.archived_at is not None,
+            "fields": sorted(key for key, value in body.model_dump().items() if value is not None),
+        }
+        if policy_change is not None:
+            detail["mcp_policy"] = policy_change
         ctx.audit(
             session,
             operation="project.update",
             resource_type="project",
             resource_id=updated.id,
             project_id=updated.id,
-            detail={
-                "archived": updated.archived_at is not None,
-                "fields": sorted(key for key, value in body.model_dump().items() if value is not None),
-            },
+            detail=detail,
         )
         payload = _project_payload(updated, ctx)
     response.headers["ETag"] = etag("project", updated.id, int(updated.row_version))
+    return payload
+
+
+@router.patch("/projects/{project_id}/mcp-policy")
+def patch_mcp_policy(
+    ctx: Ctx,
+    project_id: str,
+    body: McpPolicyPatch,
+    response: Response,
+    if_match: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """REST-only, PROJECT_MANAGE-only: a model gets no tool that widens what it may see (§5.5).
+
+    The new endpoint exists because the whole-settings `PATCH` cannot express "change one flag": it
+    replaces the document, so an administrator turning off one of four flags would have to retype the
+    rest of the project's settings and would drop any key they did not know about.
+    """
+    ctx.project(project_id, permission=Permission.PROJECT_MANAGE)
+    expected = parse_if_match(if_match, required=True)
+    patch = body.provided()
+    if not patch:
+        raise ApiError(ErrorCode.VALIDATION_ERROR, "Set at least one of the four MCP policy fields")
+    with ctx.session() as session:
+        project, before, after = AccessRepository(session, ctx.tenant_id).patch_mcp_policy(
+            project_id, patch=patch, expected_row_version=expected
+        )
+        ctx.audit(
+            session,
+            operation="project.mcp_policy.update",
+            resource_type="project",
+            resource_id=project.id,
+            project_id=project.id,
+            detail={"fields": sorted(patch), "before": before.model_dump(), "after": after.model_dump()},
+        )
+        payload = {
+            "project_id": project.id,
+            "mcp_policy": after.model_dump(),
+            "row_version": int(project.row_version),
+        }
+    # The same tag the project resource issues, because the same `row_version` guards both writers.
+    response.headers["ETag"] = etag("project", project.id, int(project.row_version))
     return payload
 
 
@@ -455,6 +508,9 @@ def _project_payload(project: Project, ctx: Ctx) -> dict[str, Any]:
         "description": project.description,
         "quota": dict(project.quota or {}),
         "settings": dict(project.settings or {}),
+        # The effective view, not the stored one: an unreadable policy reads as four flags off here, in
+        # exactly the way the MCP adapters will treat it (§5.5).
+        "mcp_policy": read_policy(project.settings).effective,
         "archived": project.archived_at is not None,
         "row_version": int(project.row_version or 1),
         "role": role.value if role is not None else None,

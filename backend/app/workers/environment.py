@@ -35,10 +35,16 @@ def build_snapshot(
     project: Any,
     run_variables: dict[str, Any] | None,
     evidence_mode: str,
+    run_ai: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The frozen inputs one execution runs with; nothing is re-read from live rows afterwards (§3.2)."""
+    """The frozen inputs one execution runs with; nothing is re-read from live rows afterwards (§3.2).
+
+    `run_ai` is present only when a caller named an AI intent, which today means the MCP adapter (§6.4).
+    Its absence is the legacy REST case and keeps the behaviour those runs have always had; it is not a
+    synonym for "no model", which is why the two are not collapsed into one default here.
+    """
     config = dict(environment_revision.config or {})
-    return {
+    snapshot = {
         "case_id": case.id,
         "case_name": case.name,
         "revision_id": revision.id,
@@ -52,6 +58,9 @@ def build_snapshot(
         "evidence_mode": evidence_mode,
         "project_settings": dict(project.settings or {}) if project is not None else {},
     }
+    if run_ai is not None:
+        snapshot["run_ai"] = dict(run_ai)
+    return snapshot
 
 
 def ir_secret_keys(ir: dict[str, Any]) -> list[str]:

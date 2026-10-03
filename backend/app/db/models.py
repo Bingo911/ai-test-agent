@@ -204,6 +204,9 @@ class TestCase(TimestampMixin, ProjectMixin, Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_test_case_tenant_id"),
         Index("ix_test_case_project_updated", "tenant_id", "project_id", "updated_at"),
+        #: The MCP case page keys on `(created_at DESC, id DESC)` (§6.2, §11), which the `updated_at`
+        #: ordering above cannot serve; without this the page sorts the whole project to find 20 rows.
+        Index("ix_test_case_project_created", "tenant_id", "project_id", "created_at", "id"),
     )
 
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -253,7 +256,7 @@ class CompileArtifact(TimestampMixin, ProjectMixin, Base):
     __table_args__ = (
         UniqueConstraint("dedupe_key", name="uq_compile_artifact_dedupe"),
         UniqueConstraint("tenant_id", "id", name="uq_compile_artifact_tenant_id"),
-        Index("ix_compile_artifact_revision", "tenant_id", "revision_id", "created_at"),
+        Index("ix_compile_artifact_revision_latest", "tenant_id", "revision_id", "created_at", "id"),
         CheckConstraint(f"status IN {tuple(COMPILE_STATUSES)}", name="ck_compile_status"),
         ForeignKeyConstraint(
             ("tenant_id", "revision_id"),
@@ -375,6 +378,11 @@ class StepExecution(TimestampMixin, ProjectMixin, Base):
             name="fk_step_execution_tenant",
         ),
         Index("ix_step_execution_order", "execution_id", "step_no"),
+        #: The MCP step page orders `(step_no ASC, id ASC)` behind a tenant and execution filter (§6.2, §11).
+        #: The index above serves the step number but not the tiebreaker, because `id` is a string primary
+        #: key here and not the rowid SQLite would otherwise complete a secondary index with - so every
+        #: continuation of a keyset cursor sorts what it read rather than reading it in order.
+        Index("ix_step_execution_page", "tenant_id", "execution_id", "step_no", "id"),
         CheckConstraint(f"status IN {tuple(STEP_STATUSES)}", name="ck_step_status"),
         CheckConstraint(f"dispatch_state IN {tuple(item.value for item in DispatchState)}", name="ck_step_dispatch"),
     )
@@ -485,6 +493,10 @@ class Artifact(TimestampMixin, ProjectMixin, Base):
     __table_args__ = (
         UniqueConstraint("object_key", name="uq_artifact_object_key"),
         Index("ix_artifact_execution", "tenant_id", "execution_id", "kind"),
+        #: A step page asks for the evidence of its own twenty steps (§8.2), and the index above cannot reach
+        #: them without reading the run's whole evidence list first. A 200-step run with a screenshot and a
+        #: trace per step is four thousand rows read to answer with one hundred of them.
+        Index("ix_artifact_step_evidence", "tenant_id", "execution_id", "step_id", "created_at", "id"),
         CheckConstraint(f"upload_status IN {tuple(item.value for item in UploadStatus)}", name="ck_artifact_upload"),
         ForeignKeyConstraint(
             ("tenant_id", "execution_id"),
@@ -569,8 +581,17 @@ class ElementMemory(TimestampMixin, ProjectMixin, Base):
     app_version: Mapped[str | None] = mapped_column(String(60))
 
 
+#: The `worker_lease.capabilities` key naming the queues a worker process was started for (§13.5).
+QUEUES_KEY = "queues"
+
+
 class WorkerLease(TimestampMixin, Base):
-    """Platform-level scheduling table (§11.1); no tenant column."""
+    """Platform-level scheduling table (§11.1); no tenant column.
+
+    `capabilities[QUEUES_KEY]` lists the queue names the process was started for. It is written by the
+    announcer and read by the readiness probe, which may not infer that an unlabelled worker covers a
+    queue it never claimed (§13.5).
+    """
 
     __tablename__ = "worker_lease"
     __table_args__ = (UniqueConstraint("worker_id", name="uq_worker_lease_id"),)
@@ -671,3 +692,21 @@ class AuditLog(TimestampMixin, TenantMixin, Base):
     resource_id: Mapped[str | None] = mapped_column(String(36))
     request_id: Mapped[str | None] = mapped_column(String(60))
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SchemaMigration(TimestampMixin, Base):
+    """One row per structure version the deploy job applied to this database (§13.6, AC-25).
+
+    Deployment bookkeeping rather than tenant data: it carries no `tenant_id`, because the question a
+    starting process asks is "is this the structure my models expect", which is the same question for
+    every tenant. The row is what makes that answerable without a process that may not change the
+    database reading the catalogue.
+    """
+
+    __tablename__ = "schema_migration"
+    __table_args__ = (UniqueConstraint("version", name="uq_schema_migration_version"),)
+
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    contract: Mapped[str] = mapped_column(String(60), nullable=False)
+    applied_by: Mapped[str] = mapped_column(String(60), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(300))

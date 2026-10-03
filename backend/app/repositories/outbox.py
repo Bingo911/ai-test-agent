@@ -118,3 +118,50 @@ class OutboxRepository(Scoped[Outbox]):
         return int(
             self.session.scalar(select(func.count()).select_from(Outbox).where(Outbox.published_at.is_(None))) or 0
         )
+
+    def failing_publishes(self) -> int:
+        """Rows a dispatcher has tried and cannot publish yet (§13.5 capability evidence).
+
+        `mark_published` clears the error, so a non-zero count means the publish path is failing now -
+        a broker that is down, or a queue that refuses the message. The count of pending rows is not
+        this signal and never will be: an empty backlog says nothing about the broker (§13.5).
+        """
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(Outbox)
+                .where(Outbox.published_at.is_(None), Outbox.last_error.isnot(None))
+            )
+            or 0
+        )
+
+    def stalled_publishes(self, *, older_than_seconds: int) -> int:
+        """Rows past their own attempt deadline and still unpublished.
+
+        This is the positive half of the evidence: a dispatcher that stopped running leaves rows whose
+        window has closed, which a failing-publish count cannot see because nothing was ever attempted.
+        """
+        cutoff = utcnow() - timedelta(seconds=older_than_seconds)
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(Outbox)
+                .where(
+                    Outbox.published_at.is_(None),
+                    Outbox.last_error.is_(None),
+                    func.coalesce(Outbox.next_attempt_at, Outbox.created_at) <= cutoff,
+                )
+            )
+            or 0
+        )
+
+    def recent_publishes(self, *, within_seconds: int) -> int:
+        """Rows published inside the window: the only evidence that the dispatcher is running now.
+
+        The absence of a backlog is deliberately not this signal. §13.5 forbids inferring broker health
+        from an empty outbox, so a capability may only be claimed from a publish that actually happened.
+        """
+        cutoff = utcnow() - timedelta(seconds=within_seconds)
+        return int(
+            self.session.scalar(select(func.count()).select_from(Outbox).where(Outbox.published_at >= cutoff)) or 0
+        )

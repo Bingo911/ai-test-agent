@@ -14,15 +14,25 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketState
 
-from ..config import get_settings
-from ..db.base import coerce_utc, get_database, utcnow
+from ..db.base import coerce_utc, utcnow
 from ..db.models import ExecutionCommand, HumanTask
 from ..domain.enums import CommandStatus, CommandType, HumanTaskStatus, Permission
 from ..domain.errors import ApiError, ErrorCode
 from ..human.registry import get_control_plane
 from ..observability import current_request, current_tenant, get_logger
 from ..repositories.human import CommandRepository, HumanTaskRepository
-from .deps import Context, Ctx, Page, idempotent, new_request_id, page_envelope, page_params, resolve_identity_by_id
+from .deps import (
+    Context,
+    Ctx,
+    Page,
+    app_database,
+    app_settings,
+    idempotent,
+    new_request_id,
+    page_envelope,
+    page_params,
+    resolve_identity_by_id,
+)
 from .tickets import CONTROL, get_ticket_store
 
 router = APIRouter(tags=["human"])
@@ -162,13 +172,13 @@ def _command_horizon(ctx: Context) -> Any:
 
 
 def _await_result(
-    tenant_id: str, command_id: str, *, timeout: float = COMMAND_RESULT_WAIT_SECONDS
+    ctx: Context, command_id: str, *, timeout: float = COMMAND_RESULT_WAIT_SECONDS
 ) -> dict[str, Any] | None:
     """Wait briefly for the worker's verdict so the operator sees the rejection where it belongs."""
     deadline = time.monotonic() + timeout
     while True:
-        with get_database().session(tenant_id) as session:
-            row = CommandRepository(session, tenant_id).by_id(command_id)
+        with ctx.database.session(ctx.tenant_id) as session:
+            row = CommandRepository(session, ctx.tenant_id).by_id(command_id)
             if row is None:
                 return None
             if row.status in SETTLED_STATUSES:
@@ -344,7 +354,7 @@ def send_control_command(
         session.commit()
 
     delivered = get_control_plane().deliver(human_task_id, {**payload, "command_id": command_id})
-    settled = _await_result(ctx.tenant_id, command_id) if delivered else None
+    settled = _await_result(ctx, command_id) if delivered else None
     with ctx.session() as session:
         row = CommandRepository(session, ctx.tenant_id).by_id(command_id)
         out = (
@@ -469,14 +479,20 @@ def get_command(ctx: Ctx, command_id: str) -> dict[str, Any]:
 # ------------------------------------------------------------------ control socket
 
 
-def _context_from_ticket(ticket_value: str, human_task_id: str) -> Context:
+def _context_from_ticket(app: Any, ticket_value: str, human_task_id: str) -> Context:
     stored = get_ticket_store().redeem(CONTROL, ticket_value, resource_id=human_task_id)
-    settings = get_settings()
-    identity = resolve_identity_by_id(settings, stored.actor_id, stored.tenant_id)
+    settings, database = app_settings(app), app_database(app)
+    identity = resolve_identity_by_id(database, user_id=stored.actor_id, tenant_id=stored.tenant_id)
     request_id = new_request_id()
     current_tenant.set(identity.tenant_id)
     current_request.set(request_id)
-    return Context(identity=identity, request_id=request_id, settings=settings, session_epoch=stored.session_epoch)
+    return Context(
+        identity=identity,
+        request_id=request_id,
+        settings=settings,
+        database=database,
+        session_epoch=stored.session_epoch,
+    )
 
 
 def _authorize_socket(ctx: Context, human_task_id: str) -> dict[str, Any]:
@@ -502,7 +518,7 @@ def _authorize_socket(ctx: Context, human_task_id: str) -> dict[str, Any]:
 
 def _hold_lease(ctx: Context, human_task_id: str) -> bool:
     """Traffic on the socket is what renews the lease; a dead socket stops renewing it (§10.2)."""
-    with get_database().session(ctx.tenant_id) as session:
+    with ctx.database.session(ctx.tenant_id) as session:
         return HumanTaskRepository(session, ctx.tenant_id).hold_control_lease(
             human_task_id, actor_id=ctx.actor_id, ttl_seconds=int(ctx.settings.human_wait_timeout_seconds)
         )
@@ -510,7 +526,7 @@ def _hold_lease(ctx: Context, human_task_id: str) -> bool:
 
 def _release_socket(ctx: Context, human_task_id: str) -> None:
     """Disconnect releases control but keeps the task open for a re-claim (§10.3 point 2)."""
-    with get_database().session(ctx.tenant_id) as session:
+    with ctx.database.session(ctx.tenant_id) as session:
         HumanTaskRepository(session, ctx.tenant_id).release_control(human_task_id, actor_id=ctx.actor_id)
         session.commit()
 
@@ -520,7 +536,7 @@ def _socket_command(ctx: Context, bound: dict[str, Any], human_task_id: str, com
     if not _hold_lease(ctx, human_task_id):
         return {"body": {"type": "rejected", "reason": "the control lease is no longer yours"}}
     payload = command.as_gate_command()
-    with get_database().session(ctx.tenant_id) as session:
+    with ctx.database.session(ctx.tenant_id) as session:
         row = CommandRepository(session, ctx.tenant_id).enqueue(
             project_id=str(bound["project_id"]),
             execution_id=str(bound["execution_id"]),
@@ -541,7 +557,7 @@ def _socket_command(ctx: Context, bound: dict[str, Any], human_task_id: str, com
     if not get_control_plane().deliver(human_task_id, {**payload, "command_id": command_id}):
         body["note"] = "queued for the holding worker, which reads persisted commands at each step boundary"
         return {"body": body}
-    settled = _await_result(ctx.tenant_id, command_id)
+    settled = _await_result(ctx, command_id)
     if settled is None:
         return {"body": body}
     return {
@@ -567,7 +583,7 @@ async def control_channel(
     still persisted, so the worker that owns the page is the one that validates and serialises it.
     """
     try:
-        ctx = await run_in_threadpool(_context_from_ticket, ticket, human_task_id)
+        ctx = await run_in_threadpool(_context_from_ticket, websocket.app, ticket, human_task_id)
     except ApiError as exc:
         await websocket.close(code=4403, reason=exc.message[:80])
         return

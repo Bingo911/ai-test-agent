@@ -107,6 +107,11 @@ def compile_revision(
                 )
             )
             continue
+        # From here on, this step's text is handed to the provider. Whether it answers, answers wrongly or the
+        # request never comes back, the case left the platform, and a compile that says `deterministic` about
+        # that would be the quiet downgrade §6.4 forbids. Counting successful calls instead would understate
+        # exactly the failure an operator most needs to see.
+        used_ai = True
         result = compile_step(
             ai_adapter,
             case,
@@ -117,15 +122,19 @@ def compile_revision(
         diagnostics.extend(result.diagnostics)
         if result.step is None:
             continue
-        used_ai = True
         if result.review_item:
             review_items.append(result.review_item)
         steps.append(result.step)
+
+    # The mode is decided by the hand-off above, not by whether a step came back, so a compile whose only
+    # prose step failed the model is still filed as the assisted run it was.
+    mode = "ai_assisted" if used_ai else "deterministic"
 
     if diagnostics.has_errors or not steps:
         if not diagnostics:
             diagnostics.add(Diagnostic.build("STEP_EMPTY", "No step could be compiled.", start_line=1))
         outcome.diagnostics = diagnostics.as_dicts()
+        outcome.compiler_mode = mode
         outcome.case_title = case.title
         outcome.tags = case.tags
         outcome.source_digest = case.source_digest
@@ -140,7 +149,7 @@ def compile_revision(
         "ir_version": IR_VERSION,
         "case_revision_id": revision_id,
         "source_digest": case.source_digest,
-        "compiler": {"version": COMPILER_VERSION, "mode": "ai_assisted" if used_ai else "deterministic"},
+        "compiler": {"version": COMPILER_VERSION, "mode": mode},
         "variables": case.variables,
         "defaults": {"timeout_ms": case.defaults["timeout_ms"]},
         "steps": steps,
@@ -157,6 +166,7 @@ def compile_revision(
             )
         )
         outcome.diagnostics = diagnostics.as_dicts()
+        outcome.compiler_mode = mode
         outcome.duration_ms = _elapsed(started)
         return outcome
 
@@ -173,6 +183,7 @@ def compile_revision(
     diagnostics.extend(semantic)
     if semantic.has_errors:
         outcome.diagnostics = diagnostics.as_dicts()
+        outcome.compiler_mode = mode
         outcome.duration_ms = _elapsed(started)
         if ai_adapter is not None:
             outcome.usage = ai_adapter.usage.as_dict()
@@ -182,7 +193,7 @@ def compile_revision(
     outcome.status = CompileStatus.NEEDS_REVIEW.value if review_items else CompileStatus.SUCCEEDED.value
     outcome.ir = dump
     outcome.ir_digest = ir.digest()
-    outcome.compiler_mode = "ai_assisted" if used_ai else "deterministic"
+    outcome.compiler_mode = mode
     outcome.review_items = review_items
     outcome.diagnostics = diagnostics.as_dicts()
     outcome.case_title = case.title

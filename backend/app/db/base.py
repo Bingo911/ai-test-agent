@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from sqlalchemy import DATETIME, TIMESTAMP, TypeDecorator, create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from ..config import get_settings
 from ..observability import get_logger
@@ -84,15 +86,52 @@ def is_past(value: datetime | None, *, now: datetime | None = None) -> bool:
     return reference <= (now or utcnow())
 
 
+def _lock_key(name: str) -> int:
+    """Map a lock name onto the bigint `pg_advisory_lock` takes.
+
+    `hash()` would be the obvious choice and is wrong: CPython salts string hashing per process, so
+    two deployment processes would derive different keys and both would run DDL at once. sha256 is
+    stable across processes, and the 63-bit mask keeps the value inside the signed bigint range.
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
 class Database:
-    def __init__(self, url: str, *, pool_size: int = 5, echo: bool = False) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        pool_size: int = 5,
+        max_overflow: int | None = None,
+        pool_timeout: float | None = None,
+        sqlite_busy_timeout_ms: int = 10_000,
+        echo: bool = False,
+    ) -> None:
+        # `max_overflow=None` keeps the historical behaviour of borrowing up to `pool_size` extra
+        # connections; passing 0 is how a pool says it must never borrow beyond its own size (§4.4).
+        overflow = pool_size if max_overflow is None else max_overflow
         kwargs: dict[str, object] = {"echo": echo, "future": True}
         if url.startswith("sqlite"):
             kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+            if max_overflow is not None or pool_timeout is not None:
+                # An explicitly pooled sqlite engine is the MCP one: a fixed number of file-backed
+                # connections with a short wait, so MCP cannot borrow the REST pool's capacity. The
+                # pool class is named rather than inherited so `:memory:` could never reach it.
+                kwargs.update(
+                    poolclass=QueuePool,
+                    pool_size=pool_size,
+                    max_overflow=overflow,
+                    pool_timeout=1 if pool_timeout is None else pool_timeout,
+                )
         else:
-            kwargs.update(pool_size=pool_size, max_overflow=pool_size, pool_pre_ping=True, pool_recycle=1800)
+            kwargs.update(pool_size=pool_size, max_overflow=overflow, pool_pre_ping=True, pool_recycle=1800)
+            if pool_timeout is not None:
+                kwargs["pool_timeout"] = pool_timeout
         self.url = url
         self.engine: Engine = create_engine(url, **kwargs)
+        #: The lock wait this deployment agreed to, so a per-call bound can only ever lower it (§11).
+        self.busy_timeout_ms = int(sqlite_busy_timeout_ms)
         from ..services.storage_crypto import cipher_for_dialect
 
         cipher_for_dialect(self.engine.dialect)
@@ -103,7 +142,7 @@ class Database:
                 cursor = dbapi_connection.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.execute("PRAGMA journal_mode=WAL")
-                cursor.execute("PRAGMA busy_timeout=10000")
+                cursor.execute(f"PRAGMA busy_timeout={int(sqlite_busy_timeout_ms)}")
                 cursor.close()
 
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False, future=True)
@@ -132,6 +171,26 @@ class Database:
         from . import models  # noqa: F401  (register mappers)
 
         Base.metadata.create_all(self.engine)
+
+    @contextmanager
+    def advisory_lock(self, name: str) -> Iterator[None]:
+        """Hold one named lock across connections so two processes cannot both run DDL (§13.6, AC-25).
+
+        PostgreSQL serialises the holders. SQLite has one writer anyway, so the lock is skipped there
+        rather than emulated. No timeout is set: this is held once per deployment, before any traffic, and
+        a DDL that sticks should surface as a stuck job instead of a half-applied structure.
+        """
+        if self.engine.dialect.name != "postgresql":
+            yield
+            return
+        key = _lock_key(name)
+        with self.engine.connect() as connection:
+            connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": key})
+            try:
+                yield
+            finally:
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+                connection.commit()
 
     def dispose(self) -> None:
         self.engine.dispose()

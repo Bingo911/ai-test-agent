@@ -144,6 +144,27 @@ def error_detail_view(detail: dict[str, Any] | None) -> dict[str, Any]:
     return _scrub(dict(detail or {}))
 
 
+#: The per-try locator keys a report may show. `selector` and `description` are the case's own words, so
+#: this is a projection of a step's attempt log rather than a dump of it (§12.1).
+LOCATOR_ATTEMPT_KEYS = ("strategy", "source", "selector", "description", "outcome", "matched", "reason", "elapsed_ms")
+
+
+def locator_attempt_view(attempts: Any) -> list[dict[str, Any]]:
+    """A step's locator attempts, bounded and keyed as every consumer of this document shows them.
+
+    Public because the MCP step page answers with the same shape: one rule for what an attempt record may
+    carry, in one place, rather than a second copy that can drift from the first (§8.2).
+    """
+    return [
+        {
+            key: (str(value)[:200] if key == "reason" else value)
+            for key, value in dict(item).items()
+            if key in LOCATOR_ATTEMPT_KEYS
+        }
+        for item in list(attempts or [])[:LOCATOR_ATTEMPTS_IN_REPORT]
+    ]
+
+
 def steps_detail(session, execution: TestExecution, *, tenant_id: str | None = None) -> list[dict[str, Any]]:
     """Per-step rows for `GET /executions/{id}/steps`, redacted exactly as the report is (§12.1)."""
     tenant_id = tenant_id or execution.tenant_id
@@ -164,15 +185,7 @@ def _step_section(step: StepExecution, artifacts: list[Artifact], *, sensitive: 
         "status": step.status,
         "duration_ms": int(step.duration_ms or 0),
         "locator_strategy": step.locator_strategy,
-        "locator_attempts": [
-            {
-                key: (str(value)[:200] if key == "reason" else value)
-                for key, value in dict(item).items()
-                if key
-                in ("strategy", "source", "selector", "description", "outcome", "matched", "reason", "elapsed_ms")
-            }
-            for item in list(step.locator_attempts or [])[:LOCATOR_ATTEMPTS_IN_REPORT]
-        ],
+        "locator_attempts": locator_attempt_view(step.locator_attempts),
         "error": None
         if not step.error_code
         else {

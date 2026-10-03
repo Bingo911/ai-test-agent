@@ -44,7 +44,11 @@ class Identity:
     @property
     def granted_projects(self) -> dict[str, list[str]]:
         """Display-only view for `/whoami`: which project each specialist permission came from."""
-        return {project_id: sorted(value.value) for project_id, value in sorted(self.project_grants.items()) if value}
+        return {
+            project_id: sorted(permission.value for permission in value)
+            for project_id, value in sorted(self.project_grants.items())
+            if value
+        }
 
     def can(self, permission: Permission, project_id: str | None = None) -> bool:
         if self.expires_at is not None and self.expires_at < datetime.now(timezone.utc):

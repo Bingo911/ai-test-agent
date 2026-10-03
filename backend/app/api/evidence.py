@@ -8,7 +8,6 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, StringConstraints
 
-from ..config import get_settings
 from ..db.base import coerce_utc, utcnow
 from ..db.models import Artifact
 from ..domain.enums import Permission, Sensitivity, UploadStatus
@@ -18,7 +17,7 @@ from ..reporting.report import RESTRICTED_KINDS
 from ..repositories.artifacts import ArtifactRepository
 from ..repositories.executions import ExecutionRepository
 from ..services.object_store import get_object_store, safe_filename
-from .deps import Context, Ctx, new_request_id, resolve_identity_by_id
+from .deps import Context, Ctx, app_database, app_settings, new_request_id, resolve_identity_by_id
 from .tickets import DOWNLOAD, get_ticket_store
 
 router = APIRouter(tags=["evidence"])
@@ -131,15 +130,15 @@ def issue_download_ticket(ctx: Ctx, artifact_id: str, body: DownloadTicketReques
     }
 
 
-def _context_from_download(ticket_value: str, artifact_id: str) -> Context:
+def _context_from_download(app: Any, ticket_value: str, artifact_id: str) -> Context:
     """Redeem the ticket, then rebuild the caller's authority from the database (§14.1)."""
     stored = get_ticket_store().redeem(DOWNLOAD, ticket_value, resource_id=artifact_id)
-    settings = get_settings()
-    identity = resolve_identity_by_id(settings, stored.actor_id, stored.tenant_id)
+    settings, database = app_settings(app), app_database(app)
+    identity = resolve_identity_by_id(database, user_id=stored.actor_id, tenant_id=stored.tenant_id)
     request_id = new_request_id()
     current_tenant.set(identity.tenant_id)
     current_request.set(request_id)
-    return Context(identity=identity, request_id=request_id, settings=settings)
+    return Context(identity=identity, request_id=request_id, settings=settings, database=database)
 
 
 @router.get("/artifacts/{artifact_id}/download")
@@ -149,7 +148,7 @@ def download_artifact(
     ticket: Annotated[str, Query(max_length=64)],
 ) -> Response:
     """Proxy the bytes: the object store is never exposed, and access is logged (§14.3)."""
-    ctx = _context_from_download(ticket, artifact_id)
+    ctx = _context_from_download(request.app, ticket, artifact_id)
     request_id = getattr(request.state, "request_id", None) or ctx.request_id
     artifact, mode = _load_artifact(ctx, artifact_id)
     _assert_retrievable(artifact)

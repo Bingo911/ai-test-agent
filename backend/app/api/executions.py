@@ -14,14 +14,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints
 from starlette.concurrency import run_in_threadpool
 
-from ..config import get_settings
+from ..application import executions as execution_commands
 from ..db.base import utcnow
 from ..db.models import TestExecution
 from ..domain.enums import CommandType, ExecutionStatus, Outcome, Permission
 from ..domain.errors import ApiError, ErrorCode
 from ..observability import current_request, current_tenant, get_logger
 from ..reporting.report import build_report, error_detail_view, steps_detail
-from ..repositories.cases import CaseRepository, CompileRepository
 from ..repositories.executions import ExecutionRepository
 from ..repositories.human import CommandRepository
 from ..services.executions import ExecutionService, execution_summary
@@ -29,6 +28,8 @@ from .deps import (
     Context,
     Ctx,
     Page,
+    app_database,
+    app_settings,
     get_context,
     idempotent,
     new_request_id,
@@ -60,6 +61,9 @@ class ExecutionCreate(BaseModel):
     variables: dict[str, Any] = Field(default_factory=dict)
     browser: Annotated[str | None, StringConstraints(max_length=24)] = None
     evidence_mode: Annotated[str | None, StringConstraints(max_length=16)] = None
+    #: §9.2: naming the digest promises which reviewed IR this run executes. Omitting it is a different
+    #: intent from sending it, so an old client keeps the old behaviour of running what is current.
+    expected_ir_digest: Annotated[str | None, StringConstraints(max_length=80)] = None
 
 
 class CancelRequest(BaseModel):
@@ -95,19 +99,6 @@ def _load_execution(ctx: Context, session: Any, execution_id: str) -> TestExecut
     return execution
 
 
-def _authorize_cancel(ctx: Context, execution: TestExecution) -> None:
-    project_id = execution.project_id
-    if ctx.can(Permission.EXECUTION_CANCEL_ANY, project_id):
-        return
-    if execution.requested_by == ctx.actor_id and ctx.can(Permission.EXECUTION_CANCEL_OWN, project_id):
-        return
-    raise ApiError(
-        ErrorCode.FORBIDDEN,
-        "Only the requester or a lead of this project can cancel the execution",
-        details={"requested_by": execution.requested_by},
-    )
-
-
 # ------------------------------------------------------------------------ create
 
 
@@ -119,75 +110,28 @@ def create_execution(
     idempotency_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     """Queue a run and return immediately: the scheduler, not this request, pays for the browser (§9.3)."""
-    payload = body.model_dump(mode="json")
-
-    def resolve_targets() -> tuple[str, str | None, str | None]:
-        """(project_id, case_id, revision_id) from whichever ids the caller named."""
-        with ctx.session() as session:
-            if body.compile_artifact_id:
-                artifact = CompileRepository(session, ctx.tenant_id).by_id(body.compile_artifact_id)
-                if artifact is None:
-                    raise ApiError(ErrorCode.NOT_FOUND, "Compile artifact not found in your tenant")
-                if body.revision_id and body.revision_id != artifact.revision_id:
-                    raise ApiError(
-                        ErrorCode.SEMANTIC_ERROR,
-                        "The named revision is not the one that artifact was compiled from",
-                        details={"revision_id": artifact.revision_id},
-                    )
-                revision = CaseRepository(session, ctx.tenant_id).require_revision(artifact.revision_id)
-                return str(artifact.project_id), str(revision.case_id), str(revision.id)
-            if body.case_id:
-                case = CaseRepository(session, ctx.tenant_id).by_id(body.case_id)
-                if case is None:
-                    raise ApiError(ErrorCode.NOT_FOUND, "Case not found in your tenant")
-                return str(case.project_id), str(case.id), body.revision_id or case.current_revision_id
-            raise ApiError(
-                ErrorCode.VALIDATION_ERROR,
-                "Name a compile_artifact_id or a case_id to run",
-                details={"allowed": ["compile_artifact_id", "case_id"]},
-            )
-
-    project_id, case_id, revision_id = resolve_targets()
-    ctx.project(project_id, permission=Permission.EXECUTION_RUN)
-    service = ExecutionService(ctx.settings)
-
-    def action() -> tuple[str, dict[str, Any]]:
-        execution = service.create(
-            tenant_id=ctx.tenant_id,
-            project_id=project_id,
-            case_id=str(case_id),
-            revision_id=revision_id,
+    with ctx.unit_of_work(write=True) as uow:
+        result = execution_commands.run_execution(
+            uow,
+            compile_artifact_id=body.compile_artifact_id,
+            case_id=body.case_id,
+            revision_id=body.revision_id,
             environment_id=body.environment_id,
             environment_revision_id=body.environment_revision_id,
-            compile_artifact_id=body.compile_artifact_id,
-            requested_by=ctx.actor_id,
-            run_variables=body.variables,
-            evidence_mode=body.evidence_mode,
+            variables=body.variables,
             browser=body.browser,
+            evidence_mode=body.evidence_mode,
+            expected_ir_digest=body.expected_ir_digest,
+            idempotency_key=idempotency_key,
         )
-        with ctx.session() as session:
-            ctx.audit(
-                session,
-                operation="execution.create",
-                resource_type="execution",
-                resource_id=execution.id,
-                project_id=execution.project_id,
-                detail={
-                    "case_id": execution.case_id,
-                    "revision_id": execution.revision_id,
-                    "compile_artifact_id": execution.compile_artifact_id,
-                    "environment_revision_id": execution.environment_revision_id,
-                    "browser": execution.browser,
-                    "evidence_mode": execution.evidence_mode,
-                    "variables": sorted((body.variables or {}).keys()),
-                },
-            )
-            session.commit()
-        return execution.id, _run_view(execution)
-
-    view = idempotent(ctx, route="POST /executions", key=idempotency_key, payload=payload, action=action)
-    response.headers["Location"] = f"/api/v1/executions/{view['id']}"
-    return view
+    response.headers["Location"] = f"/api/v1/executions/{result['id']}"
+    execution_id = result["id"]
+    return {
+        **result,
+        "report_url": f"/api/v1/executions/{execution_id}/report",
+        "events_url": f"/api/v1/executions/{execution_id}/events",
+        "steps_url": f"/api/v1/executions/{execution_id}/steps",
+    }
 
 
 def _run_view(execution: TestExecution) -> dict[str, Any]:
@@ -223,7 +167,7 @@ def list_executions(
     ctx.project(project_id)
     _reject_unknown(status, ExecutionStatus, "status")
     _reject_unknown(outcome, Outcome, "outcome")
-    rows, total = ExecutionService(ctx.settings).list(
+    rows, total = ExecutionService(ctx.settings, database=ctx.database).list(
         tenant_id=ctx.tenant_id,
         project_id=project_id,
         case_id=case_id,
@@ -357,39 +301,10 @@ def cancel_execution(
     idempotency_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     """202 with the *current* state; once finished the same call keeps answering with the final one."""
-    with ctx.session() as session:
-        execution = _load_execution(ctx, session, execution_id)
-        _authorize_cancel(ctx, execution)
-        project_id = execution.project_id
-
-    service = ExecutionService(ctx.settings)
-
-    def action() -> tuple[str, dict[str, Any]]:
-        stopped = service.cancel(
-            tenant_id=ctx.tenant_id,
-            execution_id=execution_id,
-            requested_by=ctx.actor_id,
-            reason=body.reason,
+    with ctx.unit_of_work(write=True) as uow:
+        execution_commands.cancel_execution(
+            uow, execution_id=execution_id, reason=body.reason, idempotency_key=idempotency_key
         )
-        with ctx.session() as session:
-            ctx.audit(
-                session,
-                operation="execution.cancel",
-                resource_type="execution",
-                resource_id=execution_id,
-                project_id=project_id,
-                detail={"reason": body.reason[:300]},
-            )
-            session.commit()
-        return stopped.id, {"id": stopped.id}
-
-    idempotent(
-        ctx,
-        route=f"POST /executions/{execution_id}/cancel",
-        key=idempotency_key,
-        payload=body.model_dump(mode="json"),
-        action=action,
-    )
     with ctx.session() as session:
         # Re-read after the command: the caller asked what the run looks like now, not what it looked
         # like when the key was first used.
@@ -452,7 +367,7 @@ def rerun_execution(
         previous = _load_execution(ctx, session, execution_id)
         ctx.require(Permission.EXECUTION_RUN, previous.project_id)
         project_id = previous.project_id
-    service = ExecutionService(ctx.settings)
+    service = ExecutionService(ctx.settings, database=ctx.database)
 
     def action() -> tuple[str, dict[str, Any]]:
         execution = service.retry(
@@ -494,7 +409,7 @@ def analyze_execution(
     with ctx.session() as session:
         execution = _load_execution(ctx, session, execution_id)
         project_id = execution.project_id
-    service = ExecutionService(ctx.settings)
+    service = ExecutionService(ctx.settings, database=ctx.database)
 
     def action() -> tuple[str, dict[str, Any]]:
         analyzed = service.analyze(tenant_id=ctx.tenant_id, execution_id=execution_id, requested_by=ctx.actor_id)
@@ -533,12 +448,12 @@ def _stream_context(
     if not ticket:
         return get_context(request, authorization, tenant_hint)
     stored = get_ticket_store().redeem(STREAM, ticket, resource_id=execution_id)
-    settings = get_settings()
-    identity = resolve_identity_by_id(settings, stored.actor_id, stored.tenant_id)
+    settings, database = app_settings(request.app), app_database(request.app)
+    identity = resolve_identity_by_id(database, user_id=stored.actor_id, tenant_id=stored.tenant_id)
     request_id = getattr(request.state, "request_id", None) or new_request_id()
     current_tenant.set(identity.tenant_id)
     current_request.set(request_id)
-    return Context(identity=identity, request_id=request_id, settings=settings)
+    return Context(identity=identity, request_id=request_id, settings=settings, database=database)
 
 
 @router.post("/executions/{execution_id}/events/ticket")
@@ -592,7 +507,7 @@ async def execution_events(
         after = int(last_event_id or 0)
     except (TypeError, ValueError):
         raise ApiError(ErrorCode.VALIDATION_ERROR, "Last-Event-ID must be the numeric sequence it issued") from None
-    service = ExecutionService(ctx.settings)
+    service = ExecutionService(ctx.settings, database=ctx.database)
     tenant_id = ctx.tenant_id
 
     floor = await run_in_threadpool(service.probe, tenant_id=tenant_id, execution_id=execution_id)

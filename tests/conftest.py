@@ -10,10 +10,16 @@ import pytest
 
 collect_ignore_glob = []
 
+# SettingsConfigDict captures its env file when backend.app.config is imported.  Establish an isolated
+# path before pytest imports application modules; setting AITA_ENV_FILE only in an autouse fixture is too
+# late when a developer's local .env exists and can silently enable MCP or a real model during tests.
+_TEST_ENV_ROOT = Path(tempfile.mkdtemp(prefix="aita-tests-"))
+os.environ["AITA_ENV_FILE"] = str(_TEST_ENV_ROOT / "absent.env")
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _environment() -> object:
-    root = Path(tempfile.mkdtemp(prefix="aita-tests-"))
+    root = _TEST_ENV_ROOT
     browsers = Path(__file__).resolve().parent.parent / ".pw-browsers"
     if browsers.is_dir():
         # The downloaded browsers live next to the project, not in ~/.cache.
@@ -59,10 +65,14 @@ def database(settings, tmp_path) -> object:
     so a leftover row from another test would be visible to a test that did not write it.
     """
     from backend.app.db.base import Database, set_database
+    from backend.app.db.schema import apply_schema
     from backend.app.services.object_store import set_object_store
 
     database = Database(f"sqlite:///{tmp_path / 'case.db'}")
-    database.create_schema()
+    # The same entry point the deploy job uses: a test database that carries no recorded structure version
+    # would be a database the readiness probe correctly calls stale, and every probe test would fail for the
+    # wrong reason.
+    apply_schema(database, applied_by="tests")
     set_database(database)
     set_object_store(None)
     yield database

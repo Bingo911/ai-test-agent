@@ -36,6 +36,7 @@ from ..repositories.artifacts import ArtifactRepository
 from ..repositories.executions import ExecutionRepository
 from ..repositories.reservations import ReservationRepository
 from ..repositories.resources import AttachmentRepository
+from ..services.ai_intent import AI_STOPPED_EVENT, intersection, server_ai_allowed
 from ..services.object_store import get_object_store, safe_filename
 from ..services.secret_store import get_secret_store
 from .environment import ExecutionPlan, build_plan
@@ -354,7 +355,7 @@ class ExecutionWorker:
         context.route_pattern = plan.route_pattern
         context.evidence_mode = plan.evidence_mode
         context.memory = self._memory(execution, plan)
-        context.vision = self._vision(plan)
+        context.vision = self._vision(plan, execution, snapshot, tenant_id)
         return plan
 
     def _memory(self, execution: TestExecution, plan: ExecutionPlan):
@@ -367,9 +368,26 @@ class ExecutionWorker:
             browser_family=plan.browser_family,
         )
 
-    def _vision(self, plan: ExecutionPlan):
+    def _vision(
+        self, plan: ExecutionPlan, execution: TestExecution, snapshot: dict[str, Any], tenant_id: str
+    ) -> AiVisionResolver | None:
         if not plan.session_config.allow_vision or not self.settings.ai_vision_enabled:
             return None
+        run_ai = snapshot.get("run_ai")
+        if isinstance(run_ai, dict):
+            # A run that recorded an AI intent is decided by that intent and by the policy as it stands now,
+            # not by the project's page setting: an MCP run never asked for the model, and a policy tightened
+            # while the run waited stops it here rather than at the boundary (§6.4).
+            with self.db.session(tenant_id) as session:
+                asked, stopped = intersection(
+                    run_ai.get("origin"),
+                    bool(run_ai.get("use_server_ai")),
+                    server_ai_allowed(session, tenant_id, execution.project_id),
+                )
+            if stopped:
+                append_event(tenant_id, execution.id, AI_STOPPED_EVENT, {"purpose": "vision", "reason": stopped})
+            if not asked:
+                return None
         from ..ai.adapter import AiAdapter
 
         return AiVisionResolver(self.settings, adapter=AiAdapter(self.settings, purpose="vision"))

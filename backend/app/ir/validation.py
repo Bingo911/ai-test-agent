@@ -194,8 +194,12 @@ def _check_condition(
             step_id=step_id,
             source=source,
         )
+        # §5.3 compares against the *resolved* expected, and `resolve_value` fails a run that was given no
+        # value for a declared variable, so a variable here cannot silently assert nothing. What must not
+        # compile is an assertion that can never hold: an empty literal, an empty template, or a secret this
+        # field does not accept (named by `_check_value` above).
         literal = _literal_of(condition.expected)
-        if literal is None or str(literal) == "":
+        if condition.expected.kind != "variable" and (literal is None or str(literal) == ""):
             diagnostics.add(
                 Diagnostic.build(
                     "CONDITION_EXPECTED_REQUIRED",

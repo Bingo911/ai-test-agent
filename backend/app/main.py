@@ -14,8 +14,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import cases, environments, evidence, executions, humans, projects, quality, system
-from .api.deps import RequestContextMiddleware, register_exception_handlers
+from .api.deps import RequestContextMiddleware, app_database, register_exception_handlers
 from .config import Settings, get_settings
+from .db.base import Database
 from .db.bootstrap import bootstrap_runtime
 from .observability import configure_logging, get_logger
 from .orchestrator.queue import InProcessQueue
@@ -51,7 +52,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
     settings.ensure_dirs()
     settings.validate_runtime()
-    workspace = bootstrap_runtime(settings, seed=settings.is_development)
+    workspace = bootstrap_runtime(settings, database=app_database(app), seed=settings.is_development)
+    bundle = getattr(app.state, "mcp", None)
+    if bundle is not None:
+        # The manager must be entered before the first MCP request can be answered, and it is entered
+        # here rather than by the mounted sub-application because a mounted Starlette app never runs
+        # its own lifespan (§4.3).
+        await bundle.start()
     supervisor = None
     if _owns_loops(settings):
         from .orchestrator.runtime import Supervisor
@@ -65,6 +72,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "auth_mode": settings.auth_mode,
                 "queue_backend": settings.queue_backend,
                 "loops_in_process": supervisor is not None,
+                "mcp_enabled": bundle is not None,
                 "project_id": (workspace or {}).get("project_id"),
             }
         },
@@ -72,6 +80,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if bundle is not None:
+            # MCP unwinds first: new commands are refused, then this adapter's threads and sockets
+            # close, and only then does the SDK session manager leave (§4.3).
+            await bundle.stop()
         if supervisor is not None:
             supervisor.stop()
             queue = supervisor.queue
@@ -83,7 +95,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("api stopped", extra={"context": {"env": settings.app_env}})
 
 
-def create_app(settings: Settings | None = None, *, openapi_extra: dict[str, Any] | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    database: Database | None = None,
+    openapi_extra: dict[str, Any] | None = None,
+) -> FastAPI:
+    """Build one app with its own Settings and Database; nothing below re-reads the environment (§4.4).
+
+    `database` defaults to the process-wide one, which is what a single-root deployment has always used.
+    A factory given a second database gets a second, independent app: the two never share a pool, and
+    neither reaches the other's through a module global.
+    """
     settings = settings or get_settings()
     configure_logging(settings.log_level, json_output=not settings.is_development)
 
@@ -104,6 +127,7 @@ def create_app(settings: Settings | None = None, *, openapi_extra: dict[str, Any
         openapi_tags=OPENAPI_TAGS,
     )
     application.state.settings = settings
+    application.state.database = database
 
     # Outermost first: an error response still needs CORS headers, or the console only sees a network fault.
     application.add_middleware(RequestContextMiddleware, max_body_bytes=settings.max_request_body_bytes)
@@ -128,6 +152,18 @@ def create_app(settings: Settings | None = None, *, openapi_extra: dict[str, Any
 
     for module in (system, projects, cases, environments, executions, humans, evidence, quality):
         application.include_router(module.router, prefix=API_PREFIX)
+    if settings.mcp_enabled:
+        # Imported only when the switch is on, so a disabled deployment never loads the SDK, builds a
+        # session manager or opens the MCP pool (§12.2 item 1).
+        from .mcp.readiness import add_readiness_route
+        from .mcp.transport import McpDispatchMiddleware, build_mcp_bundle
+
+        bundle = build_mcp_bundle(settings)
+        application.state.mcp = bundle
+        add_readiness_route(application, settings)
+        # Added last so it wraps the REST CORS stack: an MCP request never meets the console's narrower
+        # header policy, and anything that is not an exact MCP path reaches the original router (§4.1).
+        application.add_middleware(McpDispatchMiddleware, bundle=bundle)
     if openapi_extra:
         application.openapi_schema = {**(application.openapi_schema or {}), **openapi_extra}
     return application
@@ -142,7 +178,16 @@ def main() -> None:
 
     settings = get_settings()
     # `log_config=None` keeps uvicorn from reinstalling the root logger that configure_logging owns.
-    uvicorn.run(app, host=settings.api_host, port=settings.api_port, log_config=None)
+    # The forwarding trust list is passed explicitly rather than left to uvicorn's own env fallback, so the
+    # address this process believes is the one its configuration says (§13.3).
+    uvicorn.run(
+        app,
+        host=settings.api_host,
+        port=settings.api_port,
+        proxy_headers=settings.proxy_headers,
+        forwarded_allow_ips=settings.resolved_forwarded_allow_ips,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":

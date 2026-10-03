@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..config import Settings, get_settings
-from ..db.base import get_database
+from ..db.base import Database, get_database
 from ..domain.enums import Sensitivity
 from ..domain.errors import ApiError, ErrorCode
 from ..repositories.platform import AccessRepository
@@ -30,11 +30,17 @@ CONFIG_KEYS = frozenset(
 
 
 class EnvironmentService:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, database: Database | None = None) -> None:
         self.settings = settings or get_settings()
+        self._database = database
+
+    @property
+    def database(self) -> Database:
+        """The pool this service was handed; the process default only serves standalone callers."""
+        return self._database if self._database is not None else get_database()
 
     def create(self, *, tenant_id: str, project_id: str, name: str, created_by: str | None) -> dict[str, Any]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = EnvironmentRepository(session, tenant_id)
             if repos.by_name(project_id, name) is not None:
                 raise ApiError(ErrorCode.CONFLICT, f"Environment '{name}' already exists in this project")
@@ -52,7 +58,7 @@ class EnvironmentService:
         created_by: str | None,
         expected_row_version: int | None = None,
     ) -> dict[str, Any]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = EnvironmentRepository(session, tenant_id)
             environment = repos.by_id(environment_id)
             if environment is None:
@@ -117,7 +123,7 @@ class EnvironmentService:
         return cleaned
 
     def archive(self, *, tenant_id: str, environment_id: str) -> dict[str, Any]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = EnvironmentRepository(session, tenant_id)
             environment = repos.by_id(environment_id)
             if environment is None:
@@ -127,7 +133,7 @@ class EnvironmentService:
             return _environment_payload(environment, revision=None)
 
     def list(self, *, tenant_id: str, project_id: str) -> list[dict[str, Any]]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = EnvironmentRepository(session, tenant_id)
             out = []
             for environment in repos.list(project_id):
@@ -135,7 +141,7 @@ class EnvironmentService:
             return out
 
     def by_name(self, *, tenant_id: str, project_id: str, name: str) -> dict[str, Any]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = EnvironmentRepository(session, tenant_id)
             environment = repos.by_name(project_id, name)
             if environment is None:
@@ -143,7 +149,7 @@ class EnvironmentService:
             return _environment_payload(environment, revision=repos.current_revision(environment))
 
     def revisions(self, *, tenant_id: str, environment_id: str) -> list[dict[str, Any]]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = EnvironmentRepository(session, tenant_id)
             environment = repos.by_id(environment_id)
             if environment is None:
@@ -154,7 +160,7 @@ class EnvironmentService:
             ]
 
     def secret_versions(self, *, tenant_id: str, project_id: str) -> list[dict[str, Any]]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             AccessRepository(session, tenant_id).require(project_id)
             return get_secret_store(self.settings).list_for_project(session, tenant_id=tenant_id, project_id=project_id)
 
@@ -175,7 +181,7 @@ class EnvironmentService:
                 "Secret names must be identifiers, because they appear in ${secrets.<name>} references",
                 details={"logical_name": logical_name[:60]},
             )
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             AccessRepository(session, tenant_id).require(project_id)
             store = get_secret_store(self.settings)
             record = store.put(
@@ -197,7 +203,7 @@ class EnvironmentService:
             }
 
     def revoke_secret(self, *, tenant_id: str, project_id: str, logical_name: str, version: int) -> dict[str, Any]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             AccessRepository(session, tenant_id).require(project_id)
             store: SecretStore = get_secret_store(self.settings)
             store.revoke(

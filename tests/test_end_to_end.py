@@ -496,27 +496,49 @@ def test_human_control_keeps_the_browser_and_resumes_verified_steps(
                 task.id, actor_id=workspace["admin_user_id"], control_ttl_seconds=60
             )
         plane = get_control_plane()
-        frame = until(lambda: plane.latest_frame(task.id))
-        payload = {"operation": "click", "x": 60, "y": 25, "sequence": 1, "frame_id": frame["frame_id"]}
-        with database.session(tenant_id) as scope:
-            command = CommandRepository(scope, tenant_id).enqueue(
-                project_id=project_id,
-                execution_id=execution.id,
-                command_type="CONTROL",
-                dedupe_key="complete-challenge",
-                requested_by=workspace["admin_user_id"],
-                payload=payload,
-                human_task_id=task.id,
-            )
-        assert plane.deliver(task.id, {**payload, "command_id": command.id})
 
-        def processed():
+        def verdict(command_id: str) -> tuple[str, Any]:
+            """What the gateway finally said about one operator command."""
+            deadline = time.monotonic() + 20
+            status = "PENDING"
+            while time.monotonic() < deadline:
+                with database.session(tenant_id) as scope:
+                    row = CommandRepository(scope, tenant_id).by_id(command_id)
+                status = row.status
+                if status == "PROCESSED":
+                    return "processed", row.result
+                if status == "REJECTED":
+                    reason = str((row.result or {}).get("reason") or "")
+                    return ("stale" if "out of date" in reason else "rejected"), reason
+                time.sleep(0.05)
+            return "timeout", status
+
+        # The gateway republishes the picture on its own interval, so a frame can fall behind the moment
+        # after a command is written against it, and acting on an out-of-date picture is exactly what §10.2
+        # forbids. The refusal tells an operator to refresh and retry, which is what this does: only that
+        # reason is retried, and a fresh dedupe key and a higher sequence make the retry a new intent
+        # rather than a replay of the one that was refused.
+        for attempt in range(1, 6):
+            frame = until(lambda: plane.latest_frame(task.id))
+            payload = {"operation": "click", "x": 60, "y": 25, "sequence": attempt, "frame_id": frame["frame_id"]}
             with database.session(tenant_id) as scope:
-                row = CommandRepository(scope, tenant_id).by_id(command.id)
-                assert row.status != "REJECTED", row.result
-                return row.status == "PROCESSED"
-
-        until(processed)
+                command = CommandRepository(scope, tenant_id).enqueue(
+                    project_id=project_id,
+                    execution_id=execution.id,
+                    command_type="CONTROL",
+                    dedupe_key=f"complete-challenge-{attempt}",
+                    requested_by=workspace["admin_user_id"],
+                    payload=payload,
+                    human_task_id=task.id,
+                )
+            assert plane.deliver(task.id, {**payload, "command_id": command.id})
+            outcome, detail = verdict(command.id)
+            if outcome == "processed":
+                break
+            if outcome != "stale":
+                pytest.fail(f"the operator click was refused: {outcome} {detail}")
+        else:
+            pytest.fail("every operator click was refused as an out-of-date frame")
         with database.session(tenant_id) as scope:
             HumanTaskRepository(scope, tenant_id).request_resume(task.id, actor_id=workspace["admin_user_id"])
             CommandRepository(scope, tenant_id).enqueue(

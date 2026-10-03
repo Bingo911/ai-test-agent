@@ -51,17 +51,27 @@ services:
       - redis-data:/data
 
   # Structure comes up once, from a one-shot job, rather than from every API replica at startup (§15.1).
+  # The job exits non-zero when it leaves drift, so `service_completed_successfully` below blocks the API
+  # and the workers until the structure this build runs on is actually there (§13.6, AC-25).
   schema:
     <<: *app
-    command: ["python", "-c", "from app.db.base import get_database; get_database().create_schema()"]
+    command: ["python", "-m", "app.db.schema_job"]
     depends_on:
       db:
         condition: service_healthy
 
   api:
     <<: *app
+    environment:
+      <<: *app-env
+      # On a bridge network a loopback bind is unreachable from the host's published port and from the web
+      # container's `proxy_pass http://api:8000`, while a container-internal healthcheck still passes. The
+      # container binds 0.0.0.0; loopback is enforced by the published address below (§13.2).
+      API_HOST: 0.0.0.0
     ports:
-      - "8000:8000"
+      # Dev-auth tokens are only ever as private as the address that accepts them, so the host publishes
+      # on loopback rather than on every interface (§12.2, §13.2).
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -78,9 +88,12 @@ services:
   worker-execution:
     <<: *app
     # WORKER_SLOTS is the Celery concurrency: each prefork child announces exactly one browser slot.
+    # WORKER_ROLES names the queues for the readiness probe: `-Q` is invisible to the process, and an
+    # unlabelled heartbeat claims no capacity (§13.5).
     environment:
       <<: *app-env
       WORKER_SLOTS: "2"
+      WORKER_ROLES: execution
     command: ["celery", "-A", "app.celery_app:app", "worker", "-Q", "execution", "-l", "info"]
     depends_on:
       api:
@@ -93,6 +106,7 @@ services:
     environment:
       <<: *app-env
       WORKER_SLOTS: "2"
+      WORKER_ROLES: compile,analysis
     command: ["celery", "-A", "app.celery_app:app", "worker", "-Q", "compile,analysis", "-l", "info"]
     depends_on:
       api:
@@ -105,7 +119,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     depends_on:
       api:
         condition: service_healthy

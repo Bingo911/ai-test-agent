@@ -12,7 +12,7 @@ from datetime import timedelta
 from sqlalchemy import func, select, update
 
 from ..db.base import new_id, utcnow
-from ..db.models import ExecutionReservation, TestExecution, WorkerLease, WorkerPool
+from ..db.models import QUEUES_KEY, ExecutionReservation, TestExecution, WorkerLease, WorkerPool
 from ..domain.enums import OCCUPYING_RESERVATION_STATUSES, ReservationStatus
 from ..domain.errors import ApiError, ErrorCode
 from .base import Scoped
@@ -249,6 +249,19 @@ class WorkerLeaseRepository(Scoped[WorkerLease]):
                 select(WorkerLease).where(WorkerLease.heartbeat_at >= cutoff, WorkerLease.draining.is_(False))
             ).all()
         )
+
+    def live_queues(self, *, ttl_seconds: int) -> set[str]:
+        """Every queue name a live, non-draining worker declared.
+
+        A lease without the declaration contributes nothing: an unlabelled heartbeat is not capacity for a
+        queue the process was never started for, and the probe may not assume it is (§13.5).
+        """
+        queues: set[str] = set()
+        for lease in self.live_workers(ttl_seconds=ttl_seconds):
+            declared = (lease.capabilities or {}).get(QUEUES_KEY)
+            if isinstance(declared, list):
+                queues.update(str(item) for item in declared)
+        return queues
 
     def mark_draining(self, worker_id: str) -> None:
         self.session.execute(update(WorkerLease).where(WorkerLease.worker_id == worker_id).values(draining=True))

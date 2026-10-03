@@ -9,25 +9,27 @@ import json
 import re
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import Depends, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..application.context import CallContext
+from ..application.identity import resolve_subject, resolve_user_id
+from ..application.unit_of_work import UnitOfWork, command_transaction
 from ..config import Settings, get_settings
-from ..db.base import get_database
-from ..db.models import Project, TenantMembership
-from ..domain.enums import Permission, Role
+from ..db.base import Database, get_database
+from ..db.models import Project
+from ..domain.enums import Permission
 from ..domain.errors import ApiError, ErrorCode
 from ..domain.rbac import Identity
 from ..observability import current_request, current_tenant, get_logger, redact
-from ..repositories.platform import AccessRepository, IdempotencyRepository, UserRepository
+from ..repositories.platform import AccessRepository, IdempotencyRepository
 
 log = get_logger(__name__)
 
@@ -96,75 +98,70 @@ def _oidc_claims(settings: Settings, token: str) -> dict[str, Any]:
     return claims
 
 
-def resolve_identity(settings: Settings, authorization: str | None, tenant_hint: str | None) -> Identity:
-    """Rebuild the caller's authority from the database on every request; never cache it (§14.1)."""
+@dataclass(frozen=True)
+class Credential:
+    """What the bearer token proved, before any database has been asked who that is (§5.1, §14.1)."""
+
+    issuer: str
+    subject: str
+    display_name: str
+
+
+def verify_credential(settings: Settings, authorization: str | None) -> Credential:
+    """Signature, issuer, audience, expiry and `sub` are all verified, never assumed (§14.1)."""
     token = _bearer(authorization)
     if settings.auth_mode == "dev":
-        issuer, subject = "local-dev", _dev_credential(settings, token)
-        display = subject
-    else:
-        claims = _oidc_claims(settings, token)
-        issuer = str(claims.get("iss") or settings.oidc_issuer or "")
-        subject = str(claims["sub"])
-        # Email is read from the token but deliberately dropped: it is a contact attribute only and must
-        # never merge accounts or carry permissions (§14.1).
-        display = str(claims.get("name") or claims.get("preferred_username") or subject)[:200]
-
-    with get_database().session() as session:
-        unscoped = AccessRepository(session, "")
-        user = unscoped.user_by_subject(issuer, subject)
-        if user is None:
-            raise ApiError(
-                ErrorCode.UNAUTHENTICATED,
-                "This identity is not provisioned; an administrator must enable it before sign-in",
-            )
-        memberships = UserRepository(session, "").tenant_memberships(user.id)
-        if not memberships:
-            raise ApiError(ErrorCode.FORBIDDEN, "The identity belongs to no tenant")
-        wanted = tenant_hint.strip() if tenant_hint else None
-        chosen = next((row for row in memberships if wanted is None or row.tenant_id == wanted), None)
-        if chosen is None:
-            # The hint only selects among tenants the caller already belongs to; it grants nothing.
-            raise ApiError(ErrorCode.FORBIDDEN, "You are not a member of that tenant")
-        tenant_id = chosen.tenant_id
-        return _identity_from(session, user, tenant_id, display=display or "", issuer=issuer, subject=subject)
+        subject = _dev_credential(settings, token)
+        return Credential(issuer="local-dev", subject=subject, display_name=subject)
+    claims = _oidc_claims(settings, token)
+    subject = str(claims["sub"])
+    # Email is read from the token but deliberately dropped: it is a contact attribute only and must
+    # never merge accounts or carry permissions (§14.1).
+    display = str(claims.get("name") or claims.get("preferred_username") or subject)[:200]
+    return Credential(
+        issuer=str(claims.get("iss") or settings.oidc_issuer or ""), subject=subject, display_name=display
+    )
 
 
-def resolve_identity_by_id(settings: Settings, user_id: str, tenant_id: str) -> Identity:
+def resolve_identity(
+    settings: Settings, database: Database, authorization: str | None, tenant_hint: str | None
+) -> Identity:
+    """Rebuild the caller's authority from the database on every request; never cache it (§14.1).
+
+    The credential is proved first and only then read against the tenant tables, on the database this
+    app instance owns: an identity resolved through another instance's connections would answer for
+    the wrong process (§4.4).
+    """
+    credential = verify_credential(settings, authorization)
+    with database.session() as session:
+        return resolve_subject(
+            session,
+            issuer=credential.issuer,
+            subject=credential.subject,
+            tenant_hint=tenant_hint,
+            display_name=credential.display_name,
+        )
+
+
+def resolve_identity_by_id(database: Database, *, user_id: str, tenant_id: str) -> Identity:
     """Re-authorise a caller who proved identity with a ticket instead of a bearer (§14.3).
 
     The ticket only says *who*; permissions are still read from the database here, so a revoked grant
     or a disabled account stops working on the next request even while the token itself stays valid.
     """
-    with get_database().session() as session:
-        user = UserRepository(session, "").by_id(user_id)
-        if user is None or user.status != "ACTIVE":
-            raise ApiError(ErrorCode.FORBIDDEN, "The identity behind the ticket is no longer active")
-        membership = session.scalar(
-            select(TenantMembership).where(TenantMembership.tenant_id == tenant_id, TenantMembership.user_id == user_id)
-        )
-        if membership is None:
-            raise ApiError(ErrorCode.FORBIDDEN, "You are not a member of that tenant")
-        return _identity_from(
-            session, user, tenant_id, display=user.display_name or "", issuer=user.issuer, subject=user.subject
-        )
+    with database.session() as session:
+        return resolve_user_id(session, user_id=user_id, tenant_id=tenant_id)
 
 
-def _identity_from(session, user: Any, tenant_id: str, *, display: str, issuer: str, subject: str) -> Identity:
-    access = AccessRepository(session, tenant_id)
-    tenant_role = access.tenant_role(tenant_id, user.id)
-    roles: dict[str, Role] = {"*": tenant_role} if tenant_role is not None else {}
-    roles.update(access.project_roles(tenant_id, user.id))
-    grants = access.grants_by_project(tenant_id=tenant_id, user_id=user.id)
-    return Identity(
-        user_id=user.id,
-        tenant_id=tenant_id,
-        display_name=display,
-        issuer=issuer,
-        subject=subject,
-        roles=roles,
-        project_grants={key: frozenset(value) for key, value in grants.items()},
-    )
+def app_settings(app: Any) -> Settings:
+    """The Settings this app instance was built with, not whatever the environment says now (§4.4)."""
+    return getattr(app.state, "settings", None) or get_settings()
+
+
+def app_database(app: Any) -> Database:
+    """The database this app instance owns; the process default only serves the module-level app."""
+    database = getattr(app.state, "database", None)
+    return database if database is not None else get_database()
 
 
 # ----------------------------------------------------------------------- context
@@ -172,11 +169,16 @@ def _identity_from(session, user: Any, tenant_id: str, *, display: str, issuer: 
 
 @dataclass
 class Context:
-    """Everything a route may legitimately know about the caller."""
+    """Everything a route may legitimately know about the caller.
+
+    Settings and database arrive from the app instance that is handling the request, so a second app
+    built with other configuration cannot answer from the first one's connections (§4.4).
+    """
 
     identity: Identity
     request_id: str
-    settings: Settings = field(default_factory=get_settings)
+    settings: Settings
+    database: Database
     #: Only a ticket-authenticated caller has one: the worker lease generation the ticket was minted in.
     session_epoch: int | None = None
 
@@ -190,8 +192,32 @@ class Context:
 
     @contextmanager
     def session(self) -> Iterator[Session]:
-        with get_database().session(self.tenant_id) as session:
+        with self.database.session(self.tenant_id) as session:
             yield session
+
+    def call_context(self) -> CallContext:
+        """Hand the same authority to a shared application case, without handing it the request."""
+        return CallContext(
+            identity=self.identity,
+            request_id=self.request_id,
+            settings=self.settings,
+            entrypoint="rest",
+            session_epoch=self.session_epoch,
+        )
+
+    def unit_of_work(self, *, write: bool = False) -> AbstractContextManager[UnitOfWork]:
+        """The transaction handle a shared application case runs in (§9.3.5).
+
+        Deliberately not a context manager on `Context`: an atomic command owns its commit through the
+        unit of work, so no route should be able to finish a transaction by leaving an indentation.
+
+        A write comes back wrapped, so a database that refused to wait for a lock reaches the caller as
+        the retryable `COMMAND_BUSY` the contract promises rather than as a driver error.
+        """
+        database, call = self.database, self.call_context()
+        if write:
+            return command_transaction(database, call)
+        return UnitOfWork(database=database, call=call, write=False)
 
     def require(self, permission: Permission, project_id: str | None = None) -> None:
         self.identity.require(permission, project_id)
@@ -246,11 +272,12 @@ def get_context(
     authorization: Annotated[str | None, Header()] = None,
     x_tenant_id: Annotated[str | None, Header(alias="X-Tenant-Id")] = None,
 ) -> Context:
-    identity = resolve_identity(get_settings(), authorization, x_tenant_id)
+    settings, database = app_settings(request.app), app_database(request.app)
+    identity = resolve_identity(settings, database, authorization, x_tenant_id)
     current_tenant.set(identity.tenant_id)
     request_id = getattr(request.state, "request_id", None) or new_request_id()
     current_request.set(request_id)
-    return Context(identity=identity, request_id=request_id, settings=get_settings())
+    return Context(identity=identity, request_id=request_id, settings=settings, database=database)
 
 
 Ctx = Annotated[Context, Depends(get_context)]

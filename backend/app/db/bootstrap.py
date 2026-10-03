@@ -9,8 +9,9 @@ from sqlalchemy import select
 
 from ..config import Settings, get_settings
 from ..domain.enums import Permission, Role
+from ..domain.mcp_policy import POLICY_KEY, McpPolicy
 from ..observability import get_logger
-from .base import new_id, utcnow
+from .base import Database, get_database, new_id, utcnow
 from .models import (
     AppUser,
     Environment,
@@ -23,25 +24,39 @@ from .models import (
     TenantMembership,
     WorkerPool,
 )
+from .schema import SchemaNotReady, apply_schema, verify_schema
 
 log = get_logger(__name__)
 
 NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://ai-test-agent.local/dev")
 
 
-def bootstrap_runtime(settings: Settings | None = None, *, seed: bool = True) -> dict[str, str]:
-    """Create the schema and, for a development database, the demo workspace. Idempotent.
+def bootstrap_runtime(
+    settings: Settings | None = None,
+    *,
+    database: Database | None = None,
+    seed: bool = True,
+) -> dict[str, str]:
+    """Bring a development database up to shape, or confirm a production one already is. Idempotent.
 
-    Called by the API lifespan, the single-process supervisor and a Celery worker process, so any of
-    them can be the first thing that runs against a fresh database.
+    Called by the API lifespan, the single-process supervisor and a Worker process. The two paths are not
+    the same thing (§13.6, AC-25): a development database is created and seeded here, because the person
+    running it has no other way to start, while a production process is not allowed to touch the structure
+    at all - the deploy job did that, and a process that cannot confirm the version it left behind refuses
+    to serve rather than starting a request path that fails on its first write.
     """
-    from .base import get_database
-
     settings = settings or get_settings()
     settings.ensure_dirs()
-    database = get_database()
-    database.create_schema()
-    if not (seed and settings.is_development):
+    database = database if database is not None else get_database()
+    if not settings.is_development:
+        verify_schema(database)
+        return {}
+    drift = apply_schema(database, applied_by="bootstrap")
+    # A development database left short is the same danger as a production one: the process would go on to
+    # serve a request path that fails on the first write to the table that never got its column.
+    if not drift.ok:
+        raise SchemaNotReady(drift)
+    if not seed:
         return {}
     with database.session() as session:
         workspace = ensure_development_workspace(session, settings)
@@ -74,6 +89,32 @@ DEVELOPMENT_WORKSPACE: dict[str, Any] = {
     },
     "pools": [{"name": "default", "capacity": 4}],
 }
+
+
+#: What a development workspace seeds when MCP is on. `allow_server_ai` stays off: content leaving
+#: toward a client's model and the platform calling a model itself are two separate decisions (§5.5).
+DEVELOPMENT_MCP_POLICY = McpPolicy(
+    enabled=True,
+    allow_case_content=True,
+    allow_report_details=True,
+    allow_server_ai=False,
+).model_dump()
+
+
+def _seed_project_settings(settings: Settings) -> dict[str, Any]:
+    """The demo project's settings, and its MCP policy only when this build actually serves MCP.
+
+    Written once, for a project being created: an administrator who switched MCP off in a development
+    database must not find it back on after a restart, and a repeated seed must not touch versions or
+    audit (§5.5, AC-35). With MCP disabled the original seed default is preserved.
+    """
+    seeded: dict[str, Any] = {
+        "allow_vision": settings.ai_vision_enabled,
+        "human_slot_ratio": settings.human_slot_ratio,
+    }
+    if settings.mcp_enabled:
+        seeded[POLICY_KEY] = dict(DEVELOPMENT_MCP_POLICY)
+    return seeded
 
 
 def ensure_development_workspace(session, settings: Settings) -> dict[str, str]:
@@ -122,7 +163,7 @@ def ensure_development_workspace(session, settings: Settings) -> dict[str, str]:
                 name=DEVELOPMENT_WORKSPACE["project"]["name"],
                 display_name=DEVELOPMENT_WORKSPACE["project"]["display_name"],
                 quota={"max_concurrent_executions": max(1, settings.worker_slots // 2)},
-                settings={"allow_vision": settings.ai_vision_enabled, "human_slot_ratio": settings.human_slot_ratio},
+                settings=_seed_project_settings(settings),
             )
         )
         session.flush()

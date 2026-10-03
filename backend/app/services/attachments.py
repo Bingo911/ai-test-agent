@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy import select
 
 from ..config import Settings, get_settings
-from ..db.base import get_database
+from ..db.base import Database, get_database
 from ..db.models import Attachment
 from ..domain.enums import ScanStatus
 from ..domain.errors import ApiError, ErrorCode
@@ -81,8 +81,14 @@ def scan_bytes(data: bytes) -> tuple[ScanStatus, str | None]:
 
 
 class AttachmentService:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, database: Database | None = None) -> None:
         self.settings = settings or get_settings()
+        self._database = database
+
+    @property
+    def database(self) -> Database:
+        """The pool this service was handed; the process default only serves standalone callers."""
+        return self._database if self._database is not None else get_database()
 
     def store(
         self,
@@ -124,7 +130,7 @@ class AttachmentService:
             # The bytes are refused before they reach the store: quarantine is not a place to keep it.
             raise ApiError(ErrorCode.SEMANTIC_ERROR, f"The attachment failed the malware scan: {detail}")
 
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             repos = AttachmentRepository(session, tenant_id)
             duplicate = session.scalar(
                 select(Attachment).where(
@@ -154,14 +160,14 @@ class AttachmentService:
             return attachment_payload(row)
 
     def get(self, *, tenant_id: str, attachment_id: str) -> dict[str, Any]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             row = AttachmentRepository(session, tenant_id).by_id(attachment_id)
             if row is None:
                 raise ApiError(ErrorCode.NOT_FOUND, "Attachment not found in this tenant")
             return attachment_payload(row)
 
     def list(self, *, tenant_id: str, project_id: str) -> list[dict[str, Any]]:
-        with get_database().session(tenant_id) as session:
+        with self.database.session(tenant_id) as session:
             return [attachment_payload(row) for row in AttachmentRepository(session, tenant_id).list(project_id)]
 
 

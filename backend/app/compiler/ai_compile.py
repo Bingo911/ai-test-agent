@@ -167,7 +167,7 @@ def compile_step(
             )
             return AiStepResult(None, None, diagnostics)
         candidate = _shape_payload(payload, step)
-        problems = _structural_problems(candidate, step)
+        problems = _structural_problems(payload, step)
         if problems:
             last_problems = problems
             diagnostics.add(
@@ -185,7 +185,11 @@ def compile_step(
                     {"role": "user", "content": repair_prompt(prompt, call.content, problems)},
                 ]
                 continue
-            return AiStepResult(None, None, diagnostics)
+            # Not `return`: the only diagnostics so far are the INFO notes from each attempt, and a prose step
+            # that comes back with no step and no error is a step the pipeline drops. The case then compiles
+            # SUCCEEDED with one fewer step than it has, which is executable and quietly wrong. Fall out of
+            # the loop instead, where the attempt count and the problems are stated as an error.
+            break
         attempt_diagnostics = DiagnosticList()
         normalized = normalize_step(
             candidate,
@@ -235,6 +239,15 @@ def compile_step(
 
 
 def _shape_payload(payload: dict[str, Any], step: ParsedStep) -> ParsedStep:
+    """The model's reply as a structured step, with the echoed step id consumed rather than passed on.
+
+    The contract the model is shown names `id`, and `_structural_problems` insists it is this step's id, so a
+    reply that carries it is following instructions. It cannot reach `normalize_step` that way: a step id is
+    not DSL content - the normalizer takes it from the heading - and would come back
+    `Unsupported field 'id' for assert`, a repair the model cannot act on because removing it would contradict
+    the contract it was given.
+    """
+    body = {key: value for key, value in payload.items() if key != "id"} if isinstance(payload, dict) else payload
     return ParsedStep(
         number=step.number,
         step_id=step.step_id,
@@ -242,12 +255,11 @@ def _shape_payload(payload: dict[str, Any], step: ParsedStep) -> ParsedStep:
         end_line=step.end_line,
         text=step.text,
         kind="structured",
-        payload=payload,
+        payload=body,
     )
 
 
-def _structural_problems(payload_obj: ParsedStep, step: ParsedStep) -> list[str]:
-    payload = payload_obj.payload or {}
+def _structural_problems(payload: Any, step: ParsedStep) -> list[str]:
     problems: list[str] = []
     if not isinstance(payload, dict):
         return ["reply must be a JSON object"]
